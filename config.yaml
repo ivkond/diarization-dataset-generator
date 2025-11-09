@@ -1,0 +1,83 @@
+# Basic parameters
+random_seed: 42
+track_count: 1000
+
+# Dataset configuration
+dataset:
+  path: "FBK-MT/Speech-MASSIVE-test"
+  language: "ru-RU"
+  split_name: "test"
+  feature_speaker_id: "speaker_id"
+  feature_text: "utt"
+  feature_audio: "audio"
+
+# Output configuration
+output:
+  path: "./dataset"
+  repo_id: "ivkond/synthetic-speech-diarization-ru"
+  parquet_file_size_mb: 100
+
+# Track structure
+track:
+  min_duration: 30.0
+  max_duration: 60.0
+  pause:
+    min_ms: 200
+    max_ms: 1200
+  long_pause:
+    probability: 0.1
+    min: 2.0
+    max: 5.0
+  short_segment:
+    probability: 0.2
+    max_duration: 1.0
+
+# Speakers configuration
+speakers:
+  min: 2
+  max: 4
+  target_count: 30
+  max_consecutive: 3
+  volume:
+    min: 0.7
+    max: 1.3
+
+# Overlaps configuration
+overlaps:
+  probability: 0.3
+  min_percent: 0.1
+  max_percent: 0.3
+
+# Simultaneous speech
+simultaneous_speech:
+  probability: 0.25
+  min_duration: 0.5
+  max_duration: 3.0
+
+# Background noise
+noise:
+  probability: 0.55
+  types:
+    - white
+    - pink
+    - brown
+    - crowd
+    - cafe
+    - static
+    - hum
+  snr:
+    min: 10.0
+    max: 30.0
+
+# Conversation patterns (probabilities should sum to 1.0)
+conversation_patterns:
+  dialogue: 0.4
+  monologue: 0.2
+  group_discussion: 0.2
+  interview: 0.2
+
+# Difficulty distribution (probabilities should sum to 1.0)
+difficulty_distribution:
+  easy: 0.33
+  medium: 0.33
+  hard: 0.34
