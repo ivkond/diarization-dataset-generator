@@ -1,6 +1,6 @@
 # Basic parameters
 random_seed: 42
-track_count: 1000
+track_count: 500
 
 # Dataset configuration
 dataset:
