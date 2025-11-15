@@ -324,10 +324,10 @@ class HubUploader:
                     parquet_bytes = self._create_parquet_batch(current_batch, schema)
                     filename = f"train-{file_index:05d}.parquet"
                     
-                    # Upload to Hub
+                    # Upload to Hub in ./data directory
                     self.hf_api.upload_file(
                         path_or_fileobj=io.BytesIO(parquet_bytes),
-                        path_in_repo=filename,
+                        path_in_repo=f"data/{filename}",
                         repo_id=self.repo_id,
                         repo_type="dataset",
                         token=self.hf_token,
@@ -356,9 +356,10 @@ class HubUploader:
             parquet_bytes = self._create_parquet_batch(current_batch, schema)
             filename = f"train-{file_index:05d}.parquet"
             
+            # Upload to Hub in ./data directory
             self.hf_api.upload_file(
                 path_or_fileobj=io.BytesIO(parquet_bytes),
-                path_in_repo=filename,
+                path_in_repo=f"data/{filename}",
                 repo_id=self.repo_id,
                 repo_type="dataset",
                 token=self.hf_token,
@@ -422,7 +423,9 @@ The dataset contains audio tracks with speaker diarization annotations.
 ```python
 from datasets import load_dataset
 
-dataset = load_dataset("{self.repo_id}")
+# Load dataset from HuggingFace Hub
+# Files are stored in the 'data' directory
+dataset = load_dataset("{self.repo_id}", data_dir="data")
 ```
 """
         

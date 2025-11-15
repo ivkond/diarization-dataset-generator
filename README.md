@@ -90,7 +90,8 @@ import json
 dataset = load_dataset("parquet", data_files="dataset/train-*.parquet", split="train")
 
 # Or load from Hugging Face Hub (if uploaded)
-# dataset = load_dataset("your-username/diarization-dataset")
+# Files are stored in the 'data' directory
+# dataset = load_dataset("your-username/diarization-dataset", data_dir="data")
 ```
 
 ### Accessing Audio and Metadata
