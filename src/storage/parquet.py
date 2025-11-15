@@ -138,6 +138,12 @@ class ParquetWriter:
             ("duration", pa.float64()),
         ])
         
+        # Use struct for speaker_volumes instead of map (map is not supported by datasets)
+        speaker_volume_struct = pa.struct([
+            ("speaker_id", pa.int64()),
+            ("volume", pa.float64()),
+        ])
+        
         schema = pa.schema([
             ("audio", pa.binary()),
             ("duration", pa.float64()),
@@ -151,7 +157,7 @@ class ParquetWriter:
             ("speakers", pa.list_(speaker_struct)),
             ("noise_type", pa.string()),
             ("snr", pa.float64()),
-            ("speaker_volumes", pa.map_(pa.int64(), pa.float64())),
+            ("speaker_volumes", pa.list_(speaker_volume_struct)),
             ("simultaneous_segments", pa.list_(simultaneous_struct)),
         ])
 
@@ -177,14 +183,19 @@ class ParquetWriter:
                 })
             speakers_list.append(speakers_structs)
             
-            # Convert speaker_volumes from dict to map items
+            # Convert speaker_volumes from dict to list of structs
             volumes_data = r.get("speaker_volumes", {})
             if isinstance(volumes_data, str):
                 volumes_data = json.loads(volumes_data)
             
-            # Convert dict to list of key-value pairs for map type
-            volumes_items = [(k, v) for k, v in volumes_data.items()] if volumes_data else []
-            speaker_volumes_list.append(volumes_items)
+            # Convert dict to list of structs
+            volumes_structs = []
+            for speaker_id, volume in volumes_data.items() if volumes_data else []:
+                volumes_structs.append({
+                    "speaker_id": int(speaker_id),
+                    "volume": float(volume),
+                })
+            speaker_volumes_list.append(volumes_structs)
             
             # Convert simultaneous_segments
             sim_data = r.get("simultaneous_segments", [])
