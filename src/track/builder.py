@@ -64,7 +64,7 @@ class AudioBuilder:
 
     def build_audio(self, plan: List[TrackEvent]) -> np.ndarray:
         """
-        Build final audio from plan using pre-allocation for memory efficiency.
+        Build final audio from plan using efficient single-pass approach.
 
         Args:
             plan: List of track events.
@@ -72,28 +72,27 @@ class AudioBuilder:
         Returns:
             Final audio array.
         """
-        # Pre-calculate total size for memory efficiency
-        total_samples = 0
+        # Quick estimate of total size without loading audio (faster)
+        total_samples_estimate = 0
         for event in plan:
             if event["type"] == "segment":
-                # Estimate segment size (will be adjusted during processing)
-                audio_array = self._get_audio_from_cache_or_dataset(event["dataset_idx"])
-                if audio_array is not None:
-                    trim_start = event.get("trim_start", 0)
-                    total_samples += len(audio_array) - trim_start
+                # Use original_duration from event if available, otherwise estimate
+                duration = event.get("original_duration", 5.0)  # Default 5 seconds
+                trim_start = event.get("trim_start", 0)
+                total_samples_estimate += int((duration * SAMPLING_RATE) - trim_start)
             elif event["type"] == "pause":
-                total_samples += event["duration_samples"]
+                total_samples_estimate += event["duration_samples"]
             elif event["type"] == "simultaneous":
-                total_samples += event["duration_samples"]
-            # Overlap doesn't add samples, it modifies existing ones
+                total_samples_estimate += event["duration_samples"]
 
-        if total_samples == 0:
+        if total_samples_estimate == 0:
             raise ValueError("No audio parts to assemble")
 
-        # Pre-allocate final audio array
+        # Pre-allocate with 20% buffer to avoid frequent resizing
+        total_samples = int(total_samples_estimate * 1.2)
         final_audio = np.zeros(total_samples, dtype=np.float32)
         offset = 0
-        segment_positions = []  # Track (start, end) positions for each segment event
+        segment_positions = []  # Track (event_idx, start, end) positions for each segment event
 
         for i, event in enumerate(plan):
             if event["type"] == "segment":
@@ -102,8 +101,8 @@ class AudioBuilder:
                 if len(audio_array) > 0:
                     end = offset + len(audio_array)
                     if end > total_samples:
-                        # Resize if needed (shouldn't happen often)
-                        new_size = max(end, int(total_samples * 1.1))
+                        # Resize if needed (should be rare with 20% buffer)
+                        new_size = max(end, int(total_samples * 1.5))
                         final_audio = np.resize(final_audio, new_size)
                         total_samples = new_size
                     final_audio[offset:end] = audio_array
@@ -114,7 +113,7 @@ class AudioBuilder:
                 pause_samples = event["duration_samples"]
                 end = offset + pause_samples
                 if end > total_samples:
-                    new_size = max(end, int(total_samples * 1.1))
+                    new_size = max(end, int(total_samples * 1.5))
                     final_audio = np.resize(final_audio, new_size)
                     total_samples = new_size
                 # Pause is already zeros, no need to set
@@ -128,7 +127,7 @@ class AudioBuilder:
                 mixed = self._process_simultaneous(event)
                 end = offset + len(mixed)
                 if end > total_samples:
-                    new_size = max(end, int(total_samples * 1.1))
+                    new_size = max(end, int(total_samples * 1.5))
                     final_audio = np.resize(final_audio, new_size)
                     total_samples = new_size
                 final_audio[offset:end] = mixed

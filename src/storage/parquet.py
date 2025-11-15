@@ -161,57 +161,50 @@ class ParquetWriter:
             ("simultaneous_segments", pa.list_(simultaneous_struct)),
         ])
 
-        # Convert structured data
+        # Data already in correct format from generator - use directly
+        # Only handle backward compatibility for old JSON format
         speakers_list = []
         speaker_volumes_list = []
         simultaneous_segments_list = []
         
         for r in batch:
-            # Convert speakers from dict/list to structured format
+            # Speakers - already in correct format (list of dicts)
             speakers_data = r.get("speakers", [])
             if isinstance(speakers_data, str):
+                # Backward compatibility: parse JSON if string
                 speakers_data = json.loads(speakers_data)
-            
-            speakers_structs = []
-            for speaker in speakers_data:
-                speakers_structs.append({
-                    "speaker_id": speaker.get("speaker_id", 0),
-                    "start": speaker.get("start", 0.0),
-                    "end": speaker.get("end", 0.0),
-                    "duration": speaker.get("duration", 0.0),
-                    "text": speaker.get("text", ""),
-                })
+            # Ensure text field exists (it's optional)
+            speakers_structs = [
+                {
+                    "speaker_id": s["speaker_id"],
+                    "start": s["start"],
+                    "end": s["end"],
+                    "duration": s["duration"],
+                    "text": s.get("text", ""),
+                }
+                for s in speakers_data
+            ]
             speakers_list.append(speakers_structs)
             
-            # Convert speaker_volumes from dict to list of structs
-            volumes_data = r.get("speaker_volumes", {})
+            # Speaker volumes - already in correct format (list of structs) from generator
+            volumes_data = r.get("speaker_volumes", [])
             if isinstance(volumes_data, str):
+                # Backward compatibility: parse JSON if string
                 volumes_data = json.loads(volumes_data)
+            # If it's still a dict (old format), convert it
+            if isinstance(volumes_data, dict):
+                volumes_data = [
+                    {"speaker_id": int(sid), "volume": float(vol)}
+                    for sid, vol in volumes_data.items()
+                ]
+            speaker_volumes_list.append(volumes_data)
             
-            # Convert dict to list of structs
-            volumes_structs = []
-            for speaker_id, volume in volumes_data.items() if volumes_data else []:
-                volumes_structs.append({
-                    "speaker_id": int(speaker_id),
-                    "volume": float(volume),
-                })
-            speaker_volumes_list.append(volumes_structs)
-            
-            # Convert simultaneous_segments
+            # Simultaneous segments - already in correct format (list of dicts)
             sim_data = r.get("simultaneous_segments", [])
             if isinstance(sim_data, str):
+                # Backward compatibility: parse JSON if string
                 sim_data = json.loads(sim_data)
-            
-            sim_structs = []
-            for sim in sim_data:
-                sim_structs.append({
-                    "start": sim.get("start", 0.0),
-                    "end": sim.get("end", 0.0),
-                    "speaker1_id": sim.get("speaker1_id", 0),
-                    "speaker2_id": sim.get("speaker2_id", 0),
-                    "duration": sim.get("duration", 0.0),
-                })
-            simultaneous_segments_list.append(sim_structs)
+            simultaneous_segments_list.append(sim_data)
 
         arrays = {
             "audio": [r["audio"] for r in batch],

@@ -116,12 +116,11 @@ def _generate_track_worker(
     except Exception as e:
         return (track_id, None, str(e))
     finally:
-        # Clear large temporary objects to free memory
         # Note: We keep the audio cache for reuse across tracks in the same worker
         # as it significantly improves performance. The cache will be cleared
         # when the worker process terminates.
-        import gc
-        gc.collect()
+        # Removed gc.collect() as it adds overhead without significant benefit
+        pass
 
 
 def main() -> None:

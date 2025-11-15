@@ -368,14 +368,18 @@ class TrackGenerator:
             if actual_snr is not None:
                 track_metadata["snr"] = round(actual_snr, 2)
 
-        speaker_volumes_dict = {
-            speaker_idx + 1: round(volume, 2)
+        # Format speaker_volumes as list of structs for Parquet (not dict)
+        speaker_volumes_list = [
+            {"speaker_id": int(speaker_idx + 1), "volume": round(volume, 2)}
             for speaker_idx, volume in speaker_volumes.items()
-        }
-        track_metadata["speaker_volumes"] = speaker_volumes_dict
+        ]
+        track_metadata["speaker_volumes"] = speaker_volumes_list
 
+        # simultaneous_segments already in correct format (list of dicts)
         if simultaneous_segments:
             track_metadata["simultaneous_segments"] = simultaneous_segments
+        else:
+            track_metadata["simultaneous_segments"] = []
 
         return track_metadata
 
