@@ -14,6 +14,7 @@ from .constants import SAMPLING_RATE
 from .dataset.indexer import DatasetIndexer
 from .dataset.loader import DatasetLoader
 from .patterns.selector import PatternSelector
+from .storage.hub_uploader import HubUploader
 from .storage.parquet import ParquetWriter
 from .track.generator import TrackGenerator
 
@@ -181,12 +182,8 @@ def main() -> None:
         )
         worker_args.append(args)
     
-    # Generate tracks in parallel and write incrementally
-    output_dir = Path(config.output.path)
-    writer = ParquetWriter(
-        output_dir=output_dir,
-        max_file_size_mb=config.output.parquet_file_size_mb,
-    )
+    # Check if we should upload to HuggingFace Hub directly
+    upload_to_hub = bool(config.output.repo_id)
     
     def track_generator():
         """Generator that yields tracks as they are generated."""
@@ -224,14 +221,34 @@ def main() -> None:
         
         logger.info(f"Track generation complete: {successful_count} successful, {failed_count} failed")
     
-    # Write tracks incrementally as they are generated
-    total_files = writer.write_tracks_incremental(track_generator())
+    if upload_to_hub:
+        # Upload directly to HuggingFace Hub in streaming mode
+        logger.info(f"\nUploading directly to HuggingFace Hub: {config.output.repo_id}")
+        uploader = HubUploader(
+            repo_id=config.output.repo_id,
+            hf_token=hf_token,
+            private=False,  # Can be made configurable
+        )
+        uploader.upload_streaming(track_generator())
+        
+        logger.info("\n" + "=" * 60)
+        logger.info("Generation and upload complete!")
+        logger.info(f"Dataset available at: https://huggingface.co/datasets/{config.output.repo_id}")
+        logger.info("=" * 60)
+    else:
+        # Write tracks incrementally to Parquet files
+        output_dir = Path(config.output.path)
+        writer = ParquetWriter(
+            output_dir=output_dir,
+            max_file_size_mb=config.output.parquet_file_size_mb,
+        )
+        total_files = writer.write_tracks_incremental(track_generator())
 
-    logger.info("\n" + "=" * 60)
-    logger.info("Generation complete!")
-    logger.info(f"Written {total_files} Parquet file(s)")
-    logger.info(f"Parquet files: {output_dir.absolute()}")
-    logger.info("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("Generation complete!")
+        logger.info(f"Written {total_files} Parquet file(s)")
+        logger.info(f"Parquet files: {output_dir.absolute()}")
+        logger.info("=" * 60)
 
 
 if __name__ == "__main__":

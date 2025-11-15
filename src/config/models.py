@@ -20,7 +20,7 @@ class OutputConfig(BaseModel):
     """Output configuration."""
 
     path: str
-    repo_id: str
+    repo_id: str = ""  # Optional: if empty, save to Parquet files; if set, upload to Hub
     parquet_file_size_mb: float = Field(gt=0, description="Parquet file size limit in MB")
 
 
