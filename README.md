@@ -150,10 +150,9 @@ This dataset is generated using a modular Python script.
 │   ├── dataset/             # Source dataset loading and indexing
 │   ├── track/               # Track generation (planner, builder, generator)
 │   ├── patterns/            # Conversation patterns (Strategy pattern)
-│   └── storage/             # Parquet storage utilities
+│   └── storage/             # Storage utilities (Parquet writer, Hub uploader)
 ├── config.yaml              # Configuration file
-├── main.py                  # Entry point wrapper
-└── upload.py                # Script to upload dataset to Hugging Face Hub
+└── main.py                  # Entry point wrapper
 ```
 
 ### Installation
@@ -184,7 +183,10 @@ This will install all required packages including:
    - `random_seed`: Random seed for reproducibility
    - `track_count`: Number of tracks to generate
    - `dataset`: Dataset source configuration (path, language, split)
-   - `output`: Output directory and Parquet file size limits
+   - `output`: Output configuration:
+     - `path`: Output directory for Parquet files (used if `repo_id` is empty)
+     - `repo_id`: HuggingFace Hub repository ID (e.g., "username/dataset-name"). If set, dataset will be uploaded directly to Hub during generation. If empty, dataset will be saved to local Parquet files.
+     - `parquet_file_size_mb`: Maximum Parquet file size in MB
    - `track`: Track generation parameters (duration range, pauses, short segments)
    - `speakers`: Speaker configuration (count, volumes, consecutive limits)
    - `overlaps`: Overlap probability and percentage ranges
@@ -207,20 +209,29 @@ The script will:
 - Build speaker and metadata indices for efficient access
 - Generate audio tracks with various conversation patterns
 - Apply realistic features (overlaps, simultaneous speech, noise)
-- Save tracks as Parquet files in the `dataset/` directory
 
-### Uploading to Hugging Face Hub
+**Output modes:**
 
-After generation, upload the dataset to Hugging Face Hub:
+1. **Direct upload to HuggingFace Hub** (recommended):
+   - Set `output.repo_id` in `config.yaml` to your repository ID (e.g., `"username/dataset-name"`)
+   - Dataset will be uploaded **streamingly during generation** using batched Parquet uploads
+   - No local files are created - saves disk space and time
+   - Example:
+     ```yaml
+     output:
+       path: "./dataset"  # Not used when repo_id is set
+       repo_id: "username/dataset-name"
+     ```
 
-```bash
-python upload.py
-```
-
-This will:
-- Load Parquet files from the `dataset/` directory
-- Convert audio bytes to Hugging Face Audio format
-- Upload to the repository specified in `config.yaml`
+2. **Save to local Parquet files**:
+   - Leave `output.repo_id` empty in `config.yaml`
+   - Dataset will be saved as Parquet files in the directory specified by `output.path`
+   - Example:
+     ```yaml
+     output:
+       path: "./dataset"
+       repo_id: ""  # Empty = save locally
+     ```
 
 ## Citation
 

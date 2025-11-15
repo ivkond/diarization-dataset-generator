@@ -43,13 +43,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-hf-datasets-
 
-      - name: Run generation
+      - name: Generate and upload dataset
         run: uv run main.py
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
-      - name: Run upload
-        run: uv run upload.py
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # Note: If repo_id is set in config.yaml, upload happens automatically during generation
+        # If repo_id is empty, dataset is saved to local Parquet files
 
