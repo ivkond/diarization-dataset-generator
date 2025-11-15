@@ -4,6 +4,7 @@ import logging
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from datasets import Dataset
 
 from ..audio.processor import extract_audio_array
@@ -35,6 +36,7 @@ class TrackPlanner:
         speaker_volumes: Dict[int, float],
         metadata_cache: Dict[int, Tuple[str, str]],
         speaker_index: Dict[str, List[int]],
+        audio_cache: Optional[Dict[int, np.ndarray]] = None,
     ) -> None:
         """
         Initialize track planner.
@@ -47,6 +49,7 @@ class TrackPlanner:
             speaker_volumes: Dictionary mapping speaker index to volume.
             metadata_cache: Metadata cache (index -> (speaker_id, text)).
             speaker_index: Speaker index (speaker_id -> list of indices).
+            audio_cache: Optional audio cache dictionary (dataset_idx -> audio_array).
         """
         self.dataset = dataset
         self.config = config
@@ -55,18 +58,32 @@ class TrackPlanner:
         self.speaker_volumes = speaker_volumes
         self.metadata_cache = metadata_cache
         self.speaker_index = speaker_index
+        self.audio_cache = audio_cache if audio_cache is not None else {}
 
-        # Planning state
-        self.plan: List[TrackEvent] = []
-        self.metadata_segments: List[SegmentMetadata] = []
-        self.simultaneous_segments: List[SimultaneousSegmentMetadata] = []
-        self.current_time = 0.0
-        self.current_total_samples = 0
-        self.used_segments_by_speaker: Dict[int, set] = {
-            i: set() for i in range(len(speaker_pools))
-        }
-        self.has_overlaps = False
-        self.has_simultaneous = False
+    def _get_audio_from_cache_or_dataset(self, dataset_idx: int) -> Optional[np.ndarray]:
+        """
+        Get audio array from cache or dataset.
+        
+        Args:
+            dataset_idx: Dataset index.
+            
+        Returns:
+            Audio array or None if extraction fails.
+        """
+        # Check cache first
+        if dataset_idx in self.audio_cache:
+            return self.audio_cache[dataset_idx]
+        
+        # Extract from dataset
+        try:
+            sample = self.dataset[dataset_idx]
+            audio_array = extract_audio_array(sample[self.config.dataset.feature_audio])
+            # Store in cache for future use
+            self.audio_cache[dataset_idx] = audio_array
+            return audio_array
+        except Exception as e:
+            logger.debug(f"Failed to extract audio from dataset index {dataset_idx}: {e}")
+            return None
 
     def create_plan(
         self,
@@ -93,6 +110,18 @@ class TrackPlanner:
                 - has_overlaps: Whether overlaps were added
                 - has_simultaneous: Whether simultaneous speech was added
         """
+        # Initialize planning state
+        self.plan: List[TrackEvent] = []
+        self.metadata_segments: List[SegmentMetadata] = []
+        self.simultaneous_segments: List[SimultaneousSegmentMetadata] = []
+        self.current_time = 0.0
+        self.current_total_samples = 0
+        self.used_segments_by_speaker: Dict[int, set] = {
+            i: set() for i in range(len(self.speaker_pools))
+        }
+        self.has_overlaps = False
+        self.has_simultaneous = False
+        
         target_length_samples = int(target_duration * SAMPLING_RATE)
         available_speakers = list(range(len(self.speaker_pools)))
 
@@ -105,19 +134,30 @@ class TrackPlanner:
             # Get speaker pool and select segment
             speaker_pool = self.speaker_pools[speaker_pool_idx]
             used_indices = self.used_segments_by_speaker[speaker_pool_idx]
-            available_segments = speaker_pool.get_available_segments(used_indices)
+            available_segment_indices = speaker_pool.get_available_segments(used_indices)
 
-            if not available_segments:
+            if not available_segment_indices:
                 # All segments used, reset and reuse
                 if len(used_indices) > 0:
                     logger.info(
                         f"Speaker {speaker_pool_idx + 1}: all {len(used_indices)} unique segments used, resetting"
                     )
                     self.used_segments_by_speaker[speaker_pool_idx].clear()
-                available_segments = speaker_pool.segments
+                available_segment_indices = speaker_pool.segment_indices
 
-            audio_array, segment_dataset_index = random.choice(available_segments)
+            segment_dataset_index = random.choice(available_segment_indices)
             self.used_segments_by_speaker[speaker_pool_idx].add(segment_dataset_index)
+            
+            # Get audio array using cache
+            audio_array = speaker_pool.get_audio(
+                self.dataset, 
+                self.audio_cache, 
+                segment_dataset_index,
+                self.config,
+            )
+            if audio_array is None:
+                logger.warning(f"Failed to get audio for segment {segment_dataset_index}, skipping")
+                continue
 
             # Get metadata
             if segment_dataset_index in self.metadata_cache:
@@ -219,20 +259,29 @@ class TrackPlanner:
         )
         other_pool = self.speaker_pools[other_speaker_idx]
 
-        if len(other_pool.segments) == 0:
+        if len(other_pool.segment_indices) == 0:
             return None
 
-        other_audio, other_dataset_idx = random.choice(other_pool.segments)
+        other_dataset_idx = random.choice(other_pool.segment_indices)
+        # Get audio using cache
+        other_audio = other_pool.get_audio(
+            self.dataset,
+            self.audio_cache,
+            other_dataset_idx,
+            self.config,
+        )
+        if other_audio is None:
+            return None
         simultaneous_duration_sec = random.uniform(
             self.config.simultaneous_speech.min_duration,
             self.config.simultaneous_speech.max_duration,
         )
         simultaneous_samples = int(simultaneous_duration_sec * SAMPLING_RATE)
 
-        # Get first speaker's audio length
-        first_audio = extract_audio_array(
-            self.dataset[dataset_idx1][self.config.dataset.feature_audio]
-        )
+        # Get first speaker's audio length (use cache)
+        first_audio = self._get_audio_from_cache_or_dataset(dataset_idx1)
+        if first_audio is None:
+            return None
         min_length = min(len(first_audio), len(other_audio))
         simultaneous_samples = min(simultaneous_samples, min_length)
 

@@ -40,7 +40,7 @@ class ParquetWriter:
         """
         logger.info(f"Preparing {len(tracks)} tracks for Parquet storage...")
 
-        # Convert to Parquet format
+        # Convert to Parquet format (keep as structured data, not JSON)
         parquet_data = []
         for track in tracks:
             record = {
@@ -53,7 +53,7 @@ class ParquetWriter:
                 "has_overlaps": track["has_overlaps"],
                 "has_simultaneous": track["has_simultaneous"],
                 "has_noise": track["has_noise"],
-                "speakers": json.dumps(track["speakers"], ensure_ascii=False),
+                "speakers": track["speakers"],  # Keep as structured data
             }
 
             # Add optional fields
@@ -62,13 +62,9 @@ class ParquetWriter:
             if "snr" in track:
                 record["snr"] = track["snr"]
             if "speaker_volumes" in track:
-                record["speaker_volumes"] = json.dumps(
-                    track["speaker_volumes"], ensure_ascii=False
-                )
+                record["speaker_volumes"] = track["speaker_volumes"]  # Keep as dict
             if "simultaneous_segments" in track:
-                record["simultaneous_segments"] = json.dumps(
-                    track["simultaneous_segments"], ensure_ascii=False
-                )
+                record["simultaneous_segments"] = track["simultaneous_segments"]  # Keep as list
 
             parquet_data.append(record)
 
@@ -125,6 +121,23 @@ class ParquetWriter:
             filename = f"train-{file_index:05d}.tmp.parquet"
         filepath = self.output_dir / filename
 
+        # Define structured schema for better compression
+        speaker_struct = pa.struct([
+            ("speaker_id", pa.int64()),
+            ("start", pa.float64()),
+            ("end", pa.float64()),
+            ("duration", pa.float64()),
+            ("text", pa.string()),
+        ])
+        
+        simultaneous_struct = pa.struct([
+            ("start", pa.float64()),
+            ("end", pa.float64()),
+            ("speaker1_id", pa.int64()),
+            ("speaker2_id", pa.int64()),
+            ("duration", pa.float64()),
+        ])
+        
         schema = pa.schema([
             ("audio", pa.binary()),
             ("duration", pa.float64()),
@@ -135,12 +148,59 @@ class ParquetWriter:
             ("has_overlaps", pa.bool_()),
             ("has_simultaneous", pa.bool_()),
             ("has_noise", pa.bool_()),
-            ("speakers", pa.string()),
+            ("speakers", pa.list_(speaker_struct)),
             ("noise_type", pa.string()),
             ("snr", pa.float64()),
-            ("speaker_volumes", pa.string()),
-            ("simultaneous_segments", pa.string()),
+            ("speaker_volumes", pa.map_(pa.int64(), pa.float64())),
+            ("simultaneous_segments", pa.list_(simultaneous_struct)),
         ])
+
+        # Convert structured data
+        speakers_list = []
+        speaker_volumes_list = []
+        simultaneous_segments_list = []
+        
+        for r in batch:
+            # Convert speakers from dict/list to structured format
+            speakers_data = r.get("speakers", [])
+            if isinstance(speakers_data, str):
+                speakers_data = json.loads(speakers_data)
+            
+            speakers_structs = []
+            for speaker in speakers_data:
+                speakers_structs.append({
+                    "speaker_id": speaker.get("speaker_id", 0),
+                    "start": speaker.get("start", 0.0),
+                    "end": speaker.get("end", 0.0),
+                    "duration": speaker.get("duration", 0.0),
+                    "text": speaker.get("text", ""),
+                })
+            speakers_list.append(speakers_structs)
+            
+            # Convert speaker_volumes from dict to map items
+            volumes_data = r.get("speaker_volumes", {})
+            if isinstance(volumes_data, str):
+                volumes_data = json.loads(volumes_data)
+            
+            # Convert dict to list of key-value pairs for map type
+            volumes_items = [(k, v) for k, v in volumes_data.items()] if volumes_data else []
+            speaker_volumes_list.append(volumes_items)
+            
+            # Convert simultaneous_segments
+            sim_data = r.get("simultaneous_segments", [])
+            if isinstance(sim_data, str):
+                sim_data = json.loads(sim_data)
+            
+            sim_structs = []
+            for sim in sim_data:
+                sim_structs.append({
+                    "start": sim.get("start", 0.0),
+                    "end": sim.get("end", 0.0),
+                    "speaker1_id": sim.get("speaker1_id", 0),
+                    "speaker2_id": sim.get("speaker2_id", 0),
+                    "duration": sim.get("duration", 0.0),
+                })
+            simultaneous_segments_list.append(sim_structs)
 
         arrays = {
             "audio": [r["audio"] for r in batch],
@@ -152,15 +212,23 @@ class ParquetWriter:
             "has_overlaps": [r["has_overlaps"] for r in batch],
             "has_simultaneous": [r["has_simultaneous"] for r in batch],
             "has_noise": [r["has_noise"] for r in batch],
-            "speakers": [r["speakers"] for r in batch],
+            "speakers": speakers_list,
             "noise_type": [r.get("noise_type") for r in batch],
             "snr": [r.get("snr") for r in batch],
-            "speaker_volumes": [r.get("speaker_volumes") for r in batch],
-            "simultaneous_segments": [r.get("simultaneous_segments") for r in batch],
+            "speaker_volumes": speaker_volumes_list,
+            "simultaneous_segments": simultaneous_segments_list,
         }
 
         table = pa.table(arrays, schema=schema)
-        pq.write_table(table, filepath, compression="snappy")
+        # Use zstd compression with high compression level for better size reduction
+        pq.write_table(
+            table, 
+            filepath, 
+            compression="zstd",
+            compression_level=9,
+            row_group_size=1000,
+            use_dictionary=True,
+        )
 
         file_size_mb = filepath.stat().st_size / (1024 * 1024)
         logger.info(f"  Written {filename}: {len(batch)} records, {file_size_mb:.2f} MB")
@@ -185,7 +253,7 @@ class ParquetWriter:
         logger.info("Writing tracks incrementally to Parquet files...")
 
         for track in tracks_iterator:
-            # Convert track to Parquet format
+            # Convert track to Parquet format (keep as structured data, not JSON)
             record = {
                 "audio": track["audio"],
                 "duration": track["duration"],
@@ -196,7 +264,7 @@ class ParquetWriter:
                 "has_overlaps": track["has_overlaps"],
                 "has_simultaneous": track["has_simultaneous"],
                 "has_noise": track["has_noise"],
-                "speakers": json.dumps(track["speakers"], ensure_ascii=False),
+                "speakers": track["speakers"],  # Keep as structured data
             }
 
             # Add optional fields
@@ -205,13 +273,9 @@ class ParquetWriter:
             if "snr" in track:
                 record["snr"] = track["snr"]
             if "speaker_volumes" in track:
-                record["speaker_volumes"] = json.dumps(
-                    track["speaker_volumes"], ensure_ascii=False
-                )
+                record["speaker_volumes"] = track["speaker_volumes"]  # Keep as dict
             if "simultaneous_segments" in track:
-                record["simultaneous_segments"] = json.dumps(
-                    track["simultaneous_segments"], ensure_ascii=False
-                )
+                record["simultaneous_segments"] = track["simultaneous_segments"]  # Keep as list
 
             record_size = len(record["audio"]) + METADATA_OVERHEAD_BYTES
 

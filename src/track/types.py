@@ -1,6 +1,6 @@
 """Type definitions for track generation."""
 
-from typing import List, Tuple, TypedDict, Union
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
 import numpy as np
 
@@ -79,13 +79,47 @@ class SpeakerAudioPool:
         """
         self.speaker_idx = speaker_idx
         self.dataset_speaker_id = dataset_speaker_id
-        self.segments: List[Tuple[np.ndarray, int]] = []  # List of (audio_array, dataset_index) tuples
+        self.segment_indices: List[int] = []  # List of dataset indices only (no audio arrays)
 
-    def add_segment(self, audio_array: np.ndarray, dataset_index: int) -> None:
-        """Add audio segment to pool."""
-        self.segments.append((audio_array, dataset_index))
+    def add_segment(self, dataset_index: int) -> None:
+        """Add segment index to pool."""
+        self.segment_indices.append(dataset_index)
 
-    def get_available_segments(self, used_indices: set) -> List[Tuple[np.ndarray, int]]:
-        """Get segments not yet used."""
-        return [(audio, idx) for audio, idx in self.segments if idx not in used_indices]
+    def get_available_segments(self, used_indices: set) -> List[int]:
+        """Get segment indices not yet used."""
+        return [idx for idx in self.segment_indices if idx not in used_indices]
+    
+    def get_audio(
+        self, 
+        dataset, 
+        cache: Dict[int, np.ndarray], 
+        dataset_idx: int,
+        config: Any,
+    ) -> Optional[np.ndarray]:
+        """
+        Get audio array for a dataset index using cache or dataset.
+        
+        Args:
+            dataset: Dataset to use for audio extraction.
+            cache: Audio cache dictionary.
+            dataset_idx: Dataset index.
+            config: Configuration object.
+            
+        Returns:
+            Audio array or None if extraction fails.
+        """
+        # Check cache first
+        if dataset_idx in cache:
+            return cache[dataset_idx]
+        
+        # Extract from dataset
+        try:
+            from ..audio.processor import extract_audio_array
+            sample = dataset[dataset_idx]
+            audio_array = extract_audio_array(sample[config.dataset.feature_audio])
+            # Store in cache for future use
+            cache[dataset_idx] = audio_array
+            return audio_array
+        except Exception:
+            return None
 

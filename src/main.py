@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # Global variable to store dataset in each process
 _worker_dataset = None
 _worker_dataset_loader = None
+_worker_audio_cache: Dict[int, np.ndarray] = {}
 
 def _init_worker(
     dataset_path: str,
@@ -40,7 +41,7 @@ def _init_worker(
     Initialize worker process - load dataset once per process.
     This is called once when each worker process starts.
     """
-    global _worker_dataset, _worker_dataset_loader
+    global _worker_dataset, _worker_dataset_loader, _worker_audio_cache
     
     # Load dataset once per worker process
     _worker_dataset_loader = DatasetLoader(
@@ -51,6 +52,8 @@ def _init_worker(
         sampling_rate=sampling_rate,
     )
     _worker_dataset = _worker_dataset_loader.load()
+    # Initialize audio cache for this worker process
+    _worker_audio_cache.clear()
 
 
 def _generate_track_worker(
@@ -71,7 +74,7 @@ def _generate_track_worker(
     Returns:
         Tuple of (track_id, track_metadata or None, error_message or None)
     """
-    global _worker_dataset
+    global _worker_dataset, _worker_audio_cache
     
     (
         track_id,
@@ -90,18 +93,21 @@ def _generate_track_worker(
         np.random.seed(unique_seed)
         
         # Use pre-loaded dataset from worker initialization
+        if _worker_dataset is None:
+            return (track_id, None, "Dataset not initialized in worker process")
         dataset = _worker_dataset
         
         # Recreate pattern selector (it uses random internally)
         pattern_selector = PatternSelector(conversation_patterns)
         
-        # Create track generator
+        # Create track generator with audio cache
         track_generator = TrackGenerator(
             dataset=dataset,
             config=config,
             speaker_index=speaker_index,
             metadata_cache=metadata_cache,
             pattern_selector=pattern_selector,
+            audio_cache=_worker_audio_cache,
         )
         
         # Generate track
@@ -109,6 +115,13 @@ def _generate_track_worker(
         return (track_id, track_metadata, None)
     except Exception as e:
         return (track_id, None, str(e))
+    finally:
+        # Clear large temporary objects to free memory
+        # Note: We keep the audio cache for reuse across tracks in the same worker
+        # as it significantly improves performance. The cache will be cleared
+        # when the worker process terminates.
+        import gc
+        gc.collect()
 
 
 def main() -> None:

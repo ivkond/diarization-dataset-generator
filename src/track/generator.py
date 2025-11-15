@@ -32,6 +32,7 @@ class TrackGenerator:
         speaker_index: Dict[str, List[int]],
         metadata_cache: Dict[int, Tuple[str, str]],
         pattern_selector: Any,  # PatternSelector
+        audio_cache: Optional[Dict[int, np.ndarray]] = None,
     ) -> None:
         """
         Initialize track generator.
@@ -42,12 +43,39 @@ class TrackGenerator:
             speaker_index: Speaker index (speaker_id -> list of indices).
             metadata_cache: Metadata cache (index -> (speaker_id, text)).
             pattern_selector: Pattern selector instance.
+            audio_cache: Optional audio cache dictionary (dataset_idx -> audio_array).
         """
         self.dataset = dataset
         self.config = config
         self.speaker_index = speaker_index
         self.metadata_cache = metadata_cache
         self.pattern_selector = pattern_selector
+        self.audio_cache = audio_cache if audio_cache is not None else {}
+
+    def _get_audio_from_cache_or_dataset(self, dataset_idx: int) -> Optional[np.ndarray]:
+        """
+        Get audio array from cache or dataset.
+        
+        Args:
+            dataset_idx: Dataset index.
+            
+        Returns:
+            Audio array or None if extraction fails.
+        """
+        # Check cache first
+        if dataset_idx in self.audio_cache:
+            return self.audio_cache[dataset_idx]
+        
+        # Extract from dataset
+        try:
+            sample = self.dataset[dataset_idx]
+            audio_array = extract_audio_array(sample[self.config.dataset.feature_audio])
+            # Store in cache for future use
+            self.audio_cache[dataset_idx] = audio_array
+            return audio_array
+        except Exception as e:
+            logger.debug(f"Failed to extract audio from dataset index {dataset_idx}: {e}")
+            return None
 
     def generate(
         self, track_id: int
@@ -115,6 +143,7 @@ class TrackGenerator:
                 speaker_volumes,
                 self.metadata_cache,
                 self.speaker_index,
+                self.audio_cache,
             )
 
             # Create plan
@@ -125,7 +154,7 @@ class TrackGenerator:
             logger.info(f"  Building audio from plan ({len(plan)} events)...")
 
             # Build audio
-            builder = AudioBuilder(self.dataset, speaker_volumes, self.config)
+            builder = AudioBuilder(self.dataset, speaker_volumes, self.config, self.audio_cache)
             final_audio = builder.build_audio(plan)
 
             # Count actual speakers
@@ -220,9 +249,10 @@ class TrackGenerator:
             try:
                 sample = self.dataset[dataset_idx]
                 target_dataset_speaker_id = sample[self.config.dataset.feature_speaker_id]
-                audio_array = extract_audio_array(sample[self.config.dataset.feature_audio])
+                # Use cache for audio extraction
+                audio_array = self._get_audio_from_cache_or_dataset(dataset_idx)
 
-                if len(audio_array) == 0:
+                if audio_array is None or len(audio_array) == 0:
                     logger.warning(
                         f"  Audio at index {dataset_idx} is empty, skipping speaker..."
                     )
@@ -234,9 +264,9 @@ class TrackGenerator:
                 )
                 speaker_volumes[speaker_idx] = speaker_volume
 
-                # Create pool
+                # Create pool (store only index, not audio array)
                 pool = SpeakerAudioPool(speaker_idx, target_dataset_speaker_id)
-                pool.add_segment(audio_array, dataset_idx)
+                pool.add_segment(dataset_idx)
 
                 # Find matching segments
                 matching_indices = []
@@ -258,19 +288,15 @@ class TrackGenerator:
                 if use_short_segments:
                     short_segment_indices = []
                     for idx in matching_indices:
-                        try:
-                            sample_check = self.dataset[idx]
-                            audio_check = extract_audio_array(
-                                sample_check[self.config.dataset.feature_audio]
-                            )
+                        # Use cache for audio extraction
+                        audio_check = self._get_audio_from_cache_or_dataset(idx)
+                        if audio_check is not None:
                             duration = len(audio_check) / SAMPLING_RATE
                             if (
                                 duration <= self.config.track.short_segment.max_duration
                                 and len(audio_check) > 0
                             ):
                                 short_segment_indices.append(idx)
-                        except Exception:
-                            continue
 
                     if short_segment_indices:
                         matching_indices = short_segment_indices
@@ -283,15 +309,12 @@ class TrackGenerator:
                 added_count = 0
 
                 for other_idx in matching_indices[:target_count]:
-                    try:
-                        other_array = extract_audio_array(
-                            self.dataset[other_idx][self.config.dataset.feature_audio]
-                        )
-                        if len(other_array) > 0:
-                            pool.add_segment(other_array, other_idx)
-                            added_count += 1
-                    except Exception:
-                        continue
+                    # Use cache to check if audio is valid
+                    other_array = self._get_audio_from_cache_or_dataset(other_idx)
+                    if other_array is not None and len(other_array) > 0:
+                        # Store only index, not audio array
+                        pool.add_segment(other_idx)
+                        added_count += 1
 
                 if added_count == 0:
                     logger.warning(
