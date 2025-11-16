@@ -31,7 +31,9 @@ Each Parquet file contains multiple tracks with embedded audio (WAV bytes) and m
 
 Each record in the Parquet dataset contains:
 
-- `audio` (bytes): WAV audio file as bytes
+- `audio` (dict): Audio data in Hugging Face format with:
+  - `array` (list): Audio waveform as list of float32 values
+  - `sampling_rate` (int): Audio sampling rate (16000 Hz)
 - `duration` (float): Track duration in seconds
 - `num_speakers` (int): Number of speakers in the track
 - `sampling_rate` (int): Audio sampling rate (16000 Hz)
@@ -40,7 +42,7 @@ Each record in the Parquet dataset contains:
 - `has_overlaps` (bool): Whether the track contains overlapping speech
 - `has_simultaneous` (bool): Whether the track contains simultaneous speech
 - `has_noise` (bool): Whether background noise was added
-- `speakers` (string): JSON string containing array of speaker segments, each containing:
+- `speakers` (list): List of speaker segments (structured data), each containing:
   - `speaker_id` (int): Speaker identifier (1-indexed)
   - `start` (float): Start time in seconds
   - `end` (float): End time in seconds
@@ -48,14 +50,17 @@ Each record in the Parquet dataset contains:
   - `text` (string, optional): Transcription of the segment
 - `noise_type` (string, optional): Type of background noise if present
 - `snr` (float, optional): Signal-to-noise ratio in dB if noise is present
-- `speaker_volumes` (string, optional): JSON string with speaker volume levels
-- `simultaneous_segments` (string, optional): JSON string with simultaneous speech segments
+- `speaker_volumes` (list, optional): List of speaker volume levels (structured data)
+- `simultaneous_segments` (list, optional): List of simultaneous speech segments (structured data)
 
 ### Example Record
 
 ```python
 {
-  "audio": b"RIFF...",  # WAV bytes
+  "audio": {
+    "array": [0.0, 0.1, -0.05, ...],  # Audio waveform as list
+    "sampling_rate": 16000
+  },
   "duration": 55.44,
   "num_speakers": 3,
   "sampling_rate": 16000,
@@ -64,7 +69,10 @@ Each record in the Parquet dataset contains:
   "has_overlaps": True,
   "has_simultaneous": False,
   "has_noise": True,
-  "speakers": '[{"speaker_id": 1, "start": 0.0, "end": 6.0, "duration": 6.0, "text": "добавь встречу в офисе с василием на три часа дня во вторник"}, {"speaker_id": 2, "start": 8.15, "end": 10.45, "duration": 4.45, "text": "ответь на электронное письмо"}]',
+  "speakers": [
+    {"speaker_id": 1, "start": 0.0, "end": 6.0, "duration": 6.0, "text": "добавь встречу в офисе с василием на три часа дня во вторник"},
+    {"speaker_id": 2, "start": 8.15, "end": 10.45, "duration": 4.45, "text": "ответь на электронное письмо"}
+  ],
   "noise_type": "white",
   "snr": 20.5
 }
@@ -83,15 +91,19 @@ Each record in the Parquet dataset contains:
 ### Loading with Hugging Face Datasets
 
 ```python
-from datasets import load_dataset
-import json
+from datasets import load_dataset, Audio
+import numpy as np
 
 # Load from local Parquet files
 dataset = load_dataset("parquet", data_files="dataset/train-*.parquet", split="train")
 
+# Cast audio column to Audio feature for proper UI display and audio player
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+
 # Or load from Hugging Face Hub (if uploaded)
 # Files are stored in the 'data' directory
 # dataset = load_dataset("your-username/diarization-dataset", data_dir="data")
+# dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 ```
 
 ### Accessing Audio and Metadata
@@ -100,15 +112,14 @@ dataset = load_dataset("parquet", data_files="dataset/train-*.parquet", split="t
 # Get a sample
 sample = dataset[0]
 
-# Access audio (needs conversion from bytes)
-import io
-import soundfile as sf
-import numpy as np
+# Access audio (now in dict format with 'array' and 'sampling_rate')
+audio_dict = sample["audio"]
+audio_array = np.array(audio_dict["array"], dtype=np.float32)  # numpy array
+sampling_rate = audio_dict["sampling_rate"]  # 16000
 
-audio_bytes = sample["audio"]
-wav_buffer = io.BytesIO(audio_bytes)
-audio_array, sampling_rate = sf.read(wav_buffer)
-# audio_array is now a numpy array
+# Or if Audio feature is cast, you can access directly:
+# audio_array = sample["audio"]["array"]  # Already a numpy array
+# sampling_rate = sample["audio"]["sampling_rate"]
 
 # Access metadata
 duration = sample["duration"]
@@ -116,17 +127,15 @@ num_speakers = sample["num_speakers"]
 conversation_type = sample["conversation_type"]
 difficulty = sample["difficulty"]
 
-# Parse speakers JSON string
-speakers = json.loads(sample["speakers"])  # List of speaker segments
+# Access speakers (already in structured format, not JSON string)
+speakers = sample["speakers"]  # List of speaker segments
 ```
 
 ### Working with Speaker Segments
 
 ```python
-import json
-
-# Parse speakers JSON string
-speakers = json.loads(sample["speakers"])
+# Speakers are already in structured format (list of dicts)
+speakers = sample["speakers"]
 
 for segment in speakers:
     speaker_id = segment["speaker_id"]
