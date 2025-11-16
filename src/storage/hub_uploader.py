@@ -2,6 +2,8 @@
 
 import io
 import logging
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 import numpy as np
@@ -9,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import soundfile as sf
 from datasets import Audio, Features, Value
-from huggingface_hub import HfApi, create_repo
+from huggingface_hub import HfApi, create_repo, upload_folder
 
 from ..constants import SAMPLING_RATE
 
@@ -339,99 +341,146 @@ class HubUploader:
         file_index = 0
         total_tracks = 0
         
-        for track in tracks_iterator:
-            try:
-                # Audio will be converted to dict format in _create_parquet_batch
-                # Just prepare metadata structure
-                example = self._convert_track_to_example(track, convert_audio=False)
-                
-                # Estimate size (audio dict is larger than bytes)
-                audio_data = track["audio"]
-                if isinstance(audio_data, dict):
-                    # Python lists have significant overhead per element (pointers + object overhead)
-                    # Use conservative multiplier: ~3x the raw float32 size to account for:
-                    # - List pointer overhead (8 bytes per pointer on 64-bit systems)
-                    # - Python float object overhead (~24 bytes per float object)
-                    # - Parquet serialization overhead
-                    array_len = len(audio_data.get("array", []))
-                    array_size = array_len * 12  # Conservative: ~12 bytes per element (3x float32)
-                    estimated_size = array_size + 2000  # Metadata overhead
-                elif isinstance(audio_data, bytes):
-                    # Estimate based on expected number of float32 samples after conversion
-                    # WAV files: approximate samples = (bytes - header) / bytes_per_sample
-                    # For 16-bit mono WAV: bytes_per_sample = 2, header ~44 bytes
-                    # After conversion to float32 list: ~12 bytes per sample
-                    wav_header_size = 44  # Standard WAV header size
-                    bytes_per_sample = 2  # 16-bit = 2 bytes per sample
-                    estimated_samples = max(0, (len(audio_data) - wav_header_size) // bytes_per_sample)
-                    # Use same multiplier as dict format: 12 bytes per sample
-                    array_size = estimated_samples * 12
-                    estimated_size = array_size + 2000  # Metadata overhead
-                else:
-                    estimated_size = 50000  # Fallback estimate
-                
-                # Check if we need to upload current batch
-                if current_batch and (current_size + estimated_size) > self.max_batch_size_bytes:
-                    # Create Parquet batch and upload
-                    parquet_bytes = self._create_parquet_batch(current_batch, schema)
-                    filename = f"train-{file_index:05d}.parquet"
-                    
-                    # Upload to Hub in ./data directory
-                    self.hf_api.upload_file(
-                        path_or_fileobj=io.BytesIO(parquet_bytes),
-                        path_in_repo=f"data/{filename}",
-                        repo_id=self.repo_id,
-                        repo_type="dataset",
-                        token=self.hf_token,
-                    )
-                    
-                    logger.info(f"  Uploaded batch {file_index + 1}: {len(current_batch)} tracks, {len(parquet_bytes) / (1024*1024):.2f} MB")
-                    
-                    file_index += 1
-                    current_batch = []
-                    current_size = 0
-                
-                # Add to current batch
-                current_batch.append(example)
-                current_size += estimated_size
-                total_tracks += 1
-                
-                if total_tracks % 100 == 0:
-                    logger.info(f"  Processed {total_tracks} tracks...")
-                    
-            except Exception as e:
-                logger.error(f"Failed to process track: {e}")
-                continue
+        # Batch commits to avoid rate limits: upload multiple files per commit
+        # This reduces disk usage (only one batch at a time) and avoids 429 errors
+        commit_batch_size = 20  # Upload 20 files per commit (well below 128/hour limit)
+        files_in_current_commit = []  # List of (bytes, filename) tuples
         
-        # Upload remaining batch
+        for track in tracks_iterator:
+                try:
+                    # Audio will be converted to dict format in _create_parquet_batch
+                    # Just prepare metadata structure
+                    example = self._convert_track_to_example(track, convert_audio=False)
+                    
+                    # Estimate size (audio dict is larger than bytes)
+                    audio_data = track["audio"]
+                    if isinstance(audio_data, dict):
+                        # Python lists have significant overhead per element (pointers + object overhead)
+                        # Use conservative multiplier: ~3x the raw float32 size to account for:
+                        # - List pointer overhead (8 bytes per pointer on 64-bit systems)
+                        # - Python float object overhead (~24 bytes per float object)
+                        # - Parquet serialization overhead
+                        array_len = len(audio_data.get("array", []))
+                        array_size = array_len * 12  # Conservative: ~12 bytes per element (3x float32)
+                        estimated_size = array_size + 2000  # Metadata overhead
+                    elif isinstance(audio_data, bytes):
+                        # Estimate based on expected number of float32 samples after conversion
+                        # WAV files: approximate samples = (bytes - header) / bytes_per_sample
+                        # For 16-bit mono WAV: bytes_per_sample = 2, header ~44 bytes
+                        # After conversion to float32 list: ~12 bytes per sample
+                        wav_header_size = 44  # Standard WAV header size
+                        bytes_per_sample = 2  # 16-bit = 2 bytes per sample
+                        estimated_samples = max(0, (len(audio_data) - wav_header_size) // bytes_per_sample)
+                        # Use same multiplier as dict format: 12 bytes per sample
+                        array_size = estimated_samples * 12
+                        estimated_size = array_size + 2000  # Metadata overhead
+                    else:
+                        estimated_size = 50000  # Fallback estimate
+                    
+                    # Check if we need to save current batch to file
+                    if current_batch and (current_size + estimated_size) > self.max_batch_size_bytes:
+                        # Create Parquet batch
+                        parquet_bytes = self._create_parquet_batch(current_batch, schema)
+                        filename = f"train-{file_index:05d}.parquet"
+                        
+                        # Store bytes in memory (add to commit batch)
+                        files_in_current_commit.append((parquet_bytes, filename))
+                        
+                        # Upload commit batch when it reaches the limit
+                        if len(files_in_current_commit) >= commit_batch_size:
+                            # file_index will be incremented after this, so current value is the next file index
+                            # Start index = current file_index - number of files in batch
+                            start_file_index = file_index - len(files_in_current_commit) + 1
+                            self._upload_commit_batch(files_in_current_commit, start_file_index, total_tracks)
+                            files_in_current_commit = []
+                        
+                        logger.info(f"  Prepared batch {file_index + 1}: {len(current_batch)} tracks, {len(parquet_bytes) / (1024*1024):.2f} MB")
+                        
+                        file_index += 1
+                        current_batch = []
+                        current_size = 0
+                    
+                    # Add to current batch
+                    current_batch.append(example)
+                    current_size += estimated_size
+                    total_tracks += 1
+                    
+                    if total_tracks % 100 == 0:
+                        logger.info(f"  Processed {total_tracks} tracks...")
+                        
+                except Exception as e:
+                    logger.error(f"Failed to process track: {e}")
+                    continue
+            
+        # Save remaining batch
         if current_batch:
             parquet_bytes = self._create_parquet_batch(current_batch, schema)
             filename = f"train-{file_index:05d}.parquet"
             
-            # Upload to Hub in ./data directory
-            self.hf_api.upload_file(
-                path_or_fileobj=io.BytesIO(parquet_bytes),
-                path_in_repo=f"data/{filename}",
-                repo_id=self.repo_id,
-                repo_type="dataset",
-                token=self.hf_token,
-            )
+            files_in_current_commit.append((parquet_bytes, filename))
             
-            logger.info(f"  Uploaded final batch {file_index + 1}: {len(current_batch)} tracks, {len(parquet_bytes) / (1024*1024):.2f} MB")
+            logger.info(f"  Prepared final batch {file_index + 1}: {len(current_batch)} tracks, {len(parquet_bytes) / (1024*1024):.2f} MB")
             file_index += 1
         
         total_files = file_index
         
-        # Create dataset card and README
+        # Upload remaining files in commit batch
+        if files_in_current_commit:
+            # file_index was already incremented after adding the last file
+            # Start index = current file_index - number of files in batch
+            start_file_index = file_index - len(files_in_current_commit)
+            self._upload_commit_batch(files_in_current_commit, start_file_index, total_tracks)
+        
+        # Upload README in final commit
         logger.info("Creating dataset card...")
-        self._create_dataset_card(total_files, total_tracks)
+        readme_content = self._create_dataset_card_content(total_files, total_tracks)
+        self.hf_api.upload_file(
+            path_or_fileobj=readme_content.encode("utf-8"),
+            path_in_repo="README.md",
+            repo_id=self.repo_id,
+            repo_type="dataset",
+            token=self.hf_token,
+            commit_message="Update dataset card",
+        )
         
         logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks in {total_files} file(s) to {self.repo_id}")
         logger.info(f"  View at: https://huggingface.co/datasets/{self.repo_id}")
 
-    def _create_dataset_card(self, num_files: int, num_tracks: int) -> None:
-        """Create a basic dataset card README."""
-        readme_content = f"""---
+    def _upload_commit_batch(self, files_list: list, start_file_index: int, total_tracks_so_far: int) -> None:
+        """
+        Upload a batch of files in a single commit.
+        
+        Args:
+            files_list: List of (bytes, filename) tuples
+            start_file_index: Starting file index for this batch
+            total_tracks_so_far: Total tracks processed so far
+        """
+        # Create temporary directory and write files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            data_dir = temp_path / "data"
+            data_dir.mkdir(exist_ok=True)
+            
+            # Write all files to temporary directory
+            for parquet_bytes, filename in files_list:
+                filepath = data_dir / filename
+                with open(filepath, "wb") as f:
+                    f.write(parquet_bytes)
+            
+            # Upload all files in this batch as a single commit
+            logger.info(f"\nUploading batch of {len(files_list)} file(s) (files {start_file_index}-{start_file_index + len(files_list) - 1})...")
+            upload_folder(
+                folder_path=str(temp_path),
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                token=self.hf_token,
+                commit_message=f"Upload batch: {len(files_list)} Parquet file(s) ({total_tracks_so_far} tracks so far)",
+            )
+            logger.info(f"  ✓ Uploaded {len(files_list)} file(s) in single commit")
+
+    def _create_dataset_card_content(self, num_files: int, num_tracks: int) -> str:
+        """Create dataset card README content."""
+        return f"""---
 license: mit
 task_categories:
 - automatic-speech-recognition
@@ -473,19 +522,12 @@ The dataset contains audio tracks with speaker diarization annotations.
 ## Usage
 
 ```python
-from datasets import load_dataset
+from datasets import load_dataset, Audio
 
 # Load dataset from HuggingFace Hub
 # Files are stored in the 'data' directory
 dataset = load_dataset("{self.repo_id}", data_dir="data")
+dataset = dataset.cast_column("audio", Audio(sampling_rate={SAMPLING_RATE}))
 ```
 """
-        
-        self.hf_api.upload_file(
-            path_or_fileobj=readme_content.encode("utf-8"),
-            path_in_repo="README.md",
-            repo_id=self.repo_id,
-            repo_type="dataset",
-            token=self.hf_token,
-        )
 
