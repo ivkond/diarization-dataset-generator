@@ -104,7 +104,7 @@ class ParquetWriter:
             audio_array = audio_array.astype(np.float32)
 
         return {
-            "array": audio_array.tolist(),  # Convert numpy array to list for Parquet
+            "array": audio_array,  # Keep as numpy array for internal processing
             "sampling_rate": sr if sr else sampling_rate,
         }
 
@@ -189,8 +189,14 @@ class ParquetWriter:
         #     ("sampling_rate", pa.int64()),
         # ])
         
+        # Audio struct for dict format expected by HuggingFace Audio feature
+        audio_struct = pa.struct([
+            ("array", pa.list_(pa.float32())),  # Audio array as list of floats
+            ("sampling_rate", pa.int64()),
+        ])
+
         schema = pa.schema([
-            ("audio", pa.binary()),  # Store as raw bytes for Hugging Face Audio feature
+            ("audio", audio_struct),  # Store as structured data for Hugging Face Audio feature
             ("duration", pa.float64()),
             ("num_speakers", pa.int64()),
             ("sampling_rate", pa.int64()),
@@ -214,14 +220,23 @@ class ParquetWriter:
         audio_list = []
 
         for r in batch:
-            # Audio - keep as raw bytes for Hugging Face Audio feature
+            # Audio - convert to dict format expected by HuggingFace Audio feature
             audio_data = r.get("audio")
             if isinstance(audio_data, bytes):
-                # Already in correct format (raw WAV bytes)
-                audio_list.append(audio_data)
+                # Convert raw WAV bytes to array format for Hugging Face
+                audio_dict = self._convert_audio_bytes_to_dict(
+                    audio_data, r.get("sampling_rate", 16000)
+                )
+                audio_list.append({
+                    "array": audio_dict["array"].tolist(),  # Convert to list for Parquet
+                    "sampling_rate": audio_dict["sampling_rate"],
+                })
             else:
-                # Fallback: empty bytes
-                audio_list.append(b'')
+                # Fallback
+                audio_list.append({
+                    "array": [],
+                    "sampling_rate": r.get("sampling_rate", 16000),
+                })
 
             # Speakers - already in correct format (list of dicts)
             speakers_data = r.get("speakers", [])

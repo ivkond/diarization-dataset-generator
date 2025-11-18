@@ -79,7 +79,7 @@ class HubUploader:
             audio_array = audio_array.astype(np.float32)
 
         return {
-            "array": audio_array,
+            "array": audio_array,  # Keep as numpy array for internal processing
             "sampling_rate": sr if sr else sampling_rate,
         }
 
@@ -194,8 +194,14 @@ class HubUploader:
             ("volume", pa.float64()),
         ])
         
+        # Audio struct for dict format expected by HuggingFace Audio feature
+        audio_struct = pa.struct([
+            ("array", pa.list_(pa.float32())),  # Audio array as list of floats
+            ("sampling_rate", pa.int64()),
+        ])
+
         return pa.schema([
-            ("audio", pa.binary()),  # Store as raw bytes for Hugging Face Audio feature
+            ("audio", audio_struct),  # Store as structured data for Hugging Face Audio feature
             ("duration", pa.float64()),
             ("num_speakers", pa.int64()),
             ("sampling_rate", pa.int64()),
@@ -255,16 +261,25 @@ class HubUploader:
             sim_data = example.get("simultaneous_segments", [])
             simultaneous_segments_list.append(sim_data)
         
-        # Audio - keep as raw bytes for Hugging Face Audio feature
+        # Audio - convert to dict format expected by HuggingFace Audio feature
         audio_list = []
         for example in batch:
             audio_data = example.get("audio")
             if isinstance(audio_data, bytes):
-                # Already in correct format (raw WAV bytes)
-                audio_list.append(audio_data)
+                # Convert raw WAV bytes to array format for Hugging Face
+                audio_dict = self._convert_audio_bytes_to_audio(
+                    audio_data, example.get("sampling_rate", SAMPLING_RATE)
+                )
+                audio_list.append({
+                    "array": audio_dict["array"].tolist(),  # Convert to list for Parquet
+                    "sampling_rate": audio_dict["sampling_rate"],
+                })
             else:
-                # Fallback: empty bytes
-                audio_list.append(b'')
+                # Fallback
+                audio_list.append({
+                    "array": [],
+                    "sampling_rate": example.get("sampling_rate", SAMPLING_RATE),
+                })
 
         arrays = {
             "audio": audio_list,  # Now using raw bytes as expected by Hugging Face
