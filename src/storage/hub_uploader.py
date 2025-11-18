@@ -194,14 +194,8 @@ class HubUploader:
             ("volume", pa.float64()),
         ])
         
-        # Audio struct for dict format
-        audio_struct = pa.struct([
-            ("array", pa.list_(pa.float32())),  # Audio array as list of floats
-            ("sampling_rate", pa.int64()),
-        ])
-        
         return pa.schema([
-            ("audio", audio_struct),  # Changed from pa.binary() to audio_struct
+            ("audio", pa.binary()),  # Store as raw bytes for Hugging Face Audio feature
             ("duration", pa.float64()),
             ("num_speakers", pa.int64()),
             ("sampling_rate", pa.int64()),
@@ -261,41 +255,19 @@ class HubUploader:
             sim_data = example.get("simultaneous_segments", [])
             simultaneous_segments_list.append(sim_data)
         
-        # Audio - convert to dict format if needed
+        # Audio - keep as raw bytes for Hugging Face Audio feature
         audio_list = []
         for example in batch:
             audio_data = example.get("audio")
-            if isinstance(audio_data, dict):
-                # Already in dict format - ensure array is a list, not numpy array
-                # Use .get() to safely access keys with fallback values
-                array = audio_data.get("array", [])
-                if isinstance(array, np.ndarray):
-                    array = array.tolist()
-                elif not isinstance(array, list):
-                    # Fallback: try to convert to list
-                    array = list(array) if hasattr(array, '__iter__') else []
-                audio_list.append({
-                    "array": array,
-                    "sampling_rate": audio_data.get("sampling_rate", example.get("sampling_rate", SAMPLING_RATE)),
-                })
-            elif isinstance(audio_data, bytes):
-                # Convert bytes to dict format
-                audio_dict = self._convert_audio_bytes_to_audio(
-                    audio_data, example.get("sampling_rate", SAMPLING_RATE)
-                )
-                audio_list.append({
-                    "array": audio_dict["array"].tolist(),  # Convert numpy array to list
-                    "sampling_rate": audio_dict["sampling_rate"],
-                })
+            if isinstance(audio_data, bytes):
+                # Already in correct format (raw WAV bytes)
+                audio_list.append(audio_data)
             else:
-                # Fallback
-                audio_list.append({
-                    "array": [],
-                    "sampling_rate": example.get("sampling_rate", SAMPLING_RATE),
-                })
-        
+                # Fallback: empty bytes
+                audio_list.append(b'')
+
         arrays = {
-            "audio": audio_list,
+            "audio": audio_list,  # Now using raw bytes as expected by Hugging Face
             "duration": [e["duration"] for e in batch],
             "num_speakers": [e["num_speakers"] for e in batch],
             "sampling_rate": [e["sampling_rate"] for e in batch],
@@ -348,32 +320,33 @@ class HubUploader:
         
         for track in tracks_iterator:
                 try:
-                    # Audio will be converted to dict format in _create_parquet_batch
-                    # Just prepare metadata structure
-                    example = self._convert_track_to_example(track, convert_audio=False)
-                    
-                    # Estimate size (audio dict is larger than bytes)
+                    # For the new approach, we keep audio as raw bytes
+                    # Just prepare metadata structure without audio conversion
+                    example = {
+                        "audio": track["audio"],  # Keep as raw WAV bytes
+                        "duration": track["duration"],
+                        "num_speakers": track["num_speakers"],
+                        "sampling_rate": track["sampling_rate"],
+                        "conversation_type": track["conversation_type"],
+                        "difficulty": track["difficulty"],
+                        "has_overlaps": track["has_overlaps"],
+                        "has_simultaneous": track["has_simultaneous"],
+                        "has_noise": track["has_noise"],
+                        "speakers": track["speakers"],
+                        "speaker_volumes": track.get("speaker_volumes", []),
+                        "simultaneous_segments": track.get("simultaneous_segments", []),
+                    }
+
+                    # Add optional fields
+                    if "noise_type" in track:
+                        example["noise_type"] = track["noise_type"]
+                    if "snr" in track:
+                        example["snr"] = track["snr"]
+
+                    # Estimate size based on raw audio bytes
                     audio_data = track["audio"]
-                    if isinstance(audio_data, dict):
-                        # Python lists have significant overhead per element (pointers + object overhead)
-                        # Use conservative multiplier: ~3x the raw float32 size to account for:
-                        # - List pointer overhead (8 bytes per pointer on 64-bit systems)
-                        # - Python float object overhead (~24 bytes per float object)
-                        # - Parquet serialization overhead
-                        array_len = len(audio_data.get("array", []))
-                        array_size = array_len * 12  # Conservative: ~12 bytes per element (3x float32)
-                        estimated_size = array_size + 2000  # Metadata overhead
-                    elif isinstance(audio_data, bytes):
-                        # Estimate based on expected number of float32 samples after conversion
-                        # WAV files: approximate samples = (bytes - header) / bytes_per_sample
-                        # For 16-bit mono WAV: bytes_per_sample = 2, header ~44 bytes
-                        # After conversion to float32 list: ~12 bytes per sample
-                        wav_header_size = 44  # Standard WAV header size
-                        bytes_per_sample = 2  # 16-bit = 2 bytes per sample
-                        estimated_samples = max(0, (len(audio_data) - wav_header_size) // bytes_per_sample)
-                        # Use same multiplier as dict format: 12 bytes per sample
-                        array_size = estimated_samples * 12
-                        estimated_size = array_size + 2000  # Metadata overhead
+                    if isinstance(audio_data, bytes):
+                        estimated_size = len(audio_data) + 2000  # Metadata overhead
                     else:
                         estimated_size = 50000  # Fallback estimate
                     

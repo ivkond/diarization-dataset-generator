@@ -46,15 +46,9 @@ class ParquetWriter:
         # Convert to Parquet format (keep as structured data, not JSON)
         parquet_data = []
         for track in tracks:
-            # Convert audio bytes to dict format for Hugging Face UI
-            audio_data = track["audio"]
-            if isinstance(audio_data, bytes):
-                audio_data = self._convert_audio_bytes_to_dict(
-                    audio_data, track.get("sampling_rate", 16000)
-                )
-            
+            # Keep audio as raw bytes for Hugging Face Audio feature
             record = {
-                "audio": audio_data,
+                "audio": track["audio"],  # Keep as raw WAV bytes
                 "duration": track["duration"],
                 "num_speakers": track["num_speakers"],
                 "sampling_rate": track["sampling_rate"],
@@ -190,13 +184,13 @@ class ParquetWriter:
         ])
         
         # Audio struct for dict format
-        audio_struct = pa.struct([
-            ("array", pa.list_(pa.float32())),  # Audio array as list of floats
-            ("sampling_rate", pa.int64()),
-        ])
+        # audio_struct = pa.struct([
+        #     ("array", pa.list_(pa.float32())),  # Audio array as list of floats
+        #     ("sampling_rate", pa.int64()),
+        # ])
         
         schema = pa.schema([
-            ("audio", audio_struct),  # Changed from pa.binary() to audio_struct
+            ("audio", pa.binary()),  # Store as raw bytes for Hugging Face Audio feature
             ("duration", pa.float64()),
             ("num_speakers", pa.int64()),
             ("sampling_rate", pa.int64()),
@@ -218,36 +212,17 @@ class ParquetWriter:
         speaker_volumes_list = []
         simultaneous_segments_list = []
         audio_list = []
-        
+
         for r in batch:
-            # Audio - convert to struct format
+            # Audio - keep as raw bytes for Hugging Face Audio feature
             audio_data = r.get("audio")
-            if isinstance(audio_data, dict):
-                # Use .get() to safely access keys with fallback values
-                # Ensure array is a list, not numpy array
-                array = audio_data.get("array", [])
-                if isinstance(array, np.ndarray):
-                    array = array.tolist()
-                elif not isinstance(array, list):
-                    # Fallback: try to convert to list
-                    array = list(array) if hasattr(array, '__iter__') else []
-                audio_list.append({
-                    "array": array,
-                    "sampling_rate": audio_data.get("sampling_rate", r.get("sampling_rate", 16000)),
-                })
-            elif isinstance(audio_data, bytes):
-                # Backward compatibility: convert bytes to dict
-                audio_dict = self._convert_audio_bytes_to_dict(
-                    audio_data, r.get("sampling_rate", 16000)
-                )
-                audio_list.append(audio_dict)
+            if isinstance(audio_data, bytes):
+                # Already in correct format (raw WAV bytes)
+                audio_list.append(audio_data)
             else:
-                # Fallback
-                audio_list.append({
-                    "array": [],
-                    "sampling_rate": r.get("sampling_rate", 16000),
-                })
-            
+                # Fallback: empty bytes
+                audio_list.append(b'')
+
             # Speakers - already in correct format (list of dicts)
             speakers_data = r.get("speakers", [])
             if isinstance(speakers_data, str):
@@ -265,7 +240,7 @@ class ParquetWriter:
                 for s in speakers_data
             ]
             speakers_list.append(speakers_structs)
-            
+
             # Speaker volumes - already in correct format (list of structs) from generator
             volumes_data = r.get("speaker_volumes", [])
             if isinstance(volumes_data, str):
@@ -278,7 +253,7 @@ class ParquetWriter:
                     for sid, vol in volumes_data.items()
                 ]
             speaker_volumes_list.append(volumes_data)
-            
+
             # Simultaneous segments - already in correct format (list of dicts)
             sim_data = r.get("simultaneous_segments", [])
             if isinstance(sim_data, str):
@@ -287,7 +262,7 @@ class ParquetWriter:
             simultaneous_segments_list.append(sim_data)
 
         arrays = {
-            "audio": audio_list,  # Now using audio_list instead of raw bytes
+            "audio": audio_list,  # Now using raw bytes as expected by Hugging Face
             "duration": [r["duration"] for r in batch],
             "num_speakers": [r["num_speakers"] for r in batch],
             "sampling_rate": [r["sampling_rate"] for r in batch],
@@ -337,16 +312,10 @@ class ParquetWriter:
         logger.info("Writing tracks incrementally to Parquet files...")
 
         for track in tracks_iterator:
-            # Convert audio bytes to dict format for Hugging Face UI
-            audio_data = track["audio"]
-            if isinstance(audio_data, bytes):
-                audio_data = self._convert_audio_bytes_to_dict(
-                    audio_data, track.get("sampling_rate", 16000)
-                )
-            
-            # Convert track to Parquet format (keep as structured data, not JSON)
+            # Keep audio as raw bytes for Hugging Face Audio feature
+            # No conversion needed - keep as wav_bytes from generator
             record = {
-                "audio": audio_data,
+                "audio": track["audio"],  # Keep as raw WAV bytes
                 "duration": track["duration"],
                 "num_speakers": track["num_speakers"],
                 "sampling_rate": track["sampling_rate"],
@@ -368,18 +337,12 @@ class ParquetWriter:
             if "simultaneous_segments" in track:
                 record["simultaneous_segments"] = track["simultaneous_segments"]  # Keep as list
 
-            # Estimate size - audio dict is larger than bytes
-            if isinstance(record["audio"], dict):
-                # Python lists have significant overhead per element (pointers + object overhead)
-                # Use conservative multiplier: ~3x the raw float32 size to account for:
-                # - List pointer overhead (8 bytes per pointer on 64-bit systems)
-                # - Python float object overhead (~24 bytes per float object)
-                # - Parquet serialization overhead
-                array_len = len(record["audio"].get("array", []))
-                array_size = array_len * 12  # Conservative: ~12 bytes per element (3x float32)
-                record_size = array_size + METADATA_OVERHEAD_BYTES
+            # Estimate size - audio as raw bytes
+            audio_data = record["audio"]
+            if isinstance(audio_data, bytes):
+                record_size = len(audio_data) + METADATA_OVERHEAD_BYTES
             else:
-                record_size = len(record["audio"]) + METADATA_OVERHEAD_BYTES
+                record_size = 50000  # Fallback estimate
 
             # Check if adding this record would exceed the size limit
             if current_batch and (current_size + record_size) > self.max_file_size_bytes:
@@ -401,7 +364,7 @@ class ParquetWriter:
             file_index += 1
 
         total_files = file_index
-        
+
         # Rename temporary files to final names
         if written_files:
             logger.info(f"Renaming {len(written_files)} temporary file(s)...")
