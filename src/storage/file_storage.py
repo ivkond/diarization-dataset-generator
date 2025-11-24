@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import Dict, Iterator, Any
 
+import numpy as np
+
 from ..constants import SAMPLING_RATE
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,27 @@ class FileStorageWriter:
         
         return total_tracks
 
+    def _convert_to_json_serializable(self, obj: Any) -> Any:
+        """
+        Recursively convert numpy types and other non-JSON-serializable types to Python native types.
+        
+        Args:
+            obj: Object to convert.
+            
+        Returns:
+            JSON-serializable version of the object.
+        """
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item()  # Convert numpy scalar to Python native type
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()  # Convert numpy array to list
+        elif isinstance(obj, dict):
+            return {key: self._convert_to_json_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._convert_to_json_serializable(item) for item in obj]
+        else:
+            return obj
+
     def _prepare_metadata(self, track: Dict[str, Any], audio_path: str) -> Dict[str, Any]:
         """
         Prepare metadata dictionary for JSONL output.
@@ -98,7 +121,7 @@ class FileStorageWriter:
             audio_path: Relative path to audio file.
             
         Returns:
-            Metadata dictionary with audio_path instead of audio bytes.
+            Metadata dictionary with audio_path instead of audio bytes, with all values JSON-serializable.
         """
         metadata = {
             "audio_path": audio_path,
@@ -123,5 +146,6 @@ class FileStorageWriter:
         if "simultaneous_segments" in track:
             metadata["simultaneous_segments"] = track.get("simultaneous_segments", [])
         
-        return metadata
+        # Convert all numpy types to Python native types for JSON serialization
+        return self._convert_to_json_serializable(metadata)
 
