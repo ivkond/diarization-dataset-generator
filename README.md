@@ -14,25 +14,30 @@ This dataset contains synthetic audio tracks with multiple speakers, designed fo
 
 ### Dataset Structure
 
-The dataset is stored in Parquet format, compatible with Hugging Face Datasets:
+The dataset is stored as individual WAV audio files with JSONL metadata, compatible with Hugging Face Datasets:
 
 ```
 .
 ├── dataset/
-│   ├── train-00000-of-00001.parquet
-│   ├── train-00001-of-00001.parquet
-│   └── ...
+│   ├── audio/
+│   │   ├── track-00001.wav
+│   │   ├── track-00002.wav
+│   │   └── ...
+│   └── metadata.jsonl
 └── README.md
 ```
 
-Each Parquet file contains multiple tracks with embedded audio (WAV bytes) and metadata.
+- **Audio files**: Individual WAV files in the `audio/` directory (sequential naming: track-00001.wav, track-00002.wav, ...)
+- **Metadata**: Single JSONL file (`metadata.jsonl`) containing all track metadata, one JSON object per line
+- Each metadata line includes a relative path to the corresponding audio file
 
 ### Data Fields
 
-Each record in the Parquet dataset contains:
+Each record in the dataset contains:
 
-- `audio` (dict): Audio data in Hugging Face format with:
-  - `array` (list): Audio waveform as list of float32 values
+- `audio_path` (string): Relative path to the audio file (e.g., "audio/track-00001.wav")
+- `audio` (dict): Audio data loaded by Hugging Face Audio feature with:
+  - `array` (numpy.ndarray): Audio waveform as float32 array
   - `sampling_rate` (int): Audio sampling rate (16000 Hz)
 - `duration` (float): Track duration in seconds
 - `num_speakers` (int): Number of speakers in the track
@@ -55,12 +60,21 @@ Each record in the Parquet dataset contains:
 
 ### Example Record
 
+Example line from `metadata.jsonl`:
+
+```json
+{"audio_path": "audio/track-00001.wav", "duration": 55.44, "num_speakers": 3, "sampling_rate": 16000, "conversation_type": "dialogue", "difficulty": "medium", "has_overlaps": true, "has_simultaneous": false, "has_noise": true, "speakers": [{"speaker_id": 1, "start": 0.0, "end": 6.0, "duration": 6.0, "text": "добавь встречу в офисе с василием на три часа дня во вторник"}, {"speaker_id": 2, "start": 8.15, "end": 10.45, "duration": 4.45, "text": "ответь на электронное письмо"}], "noise_type": "white", "snr": 20.5}
+```
+
+When loaded with Hugging Face Datasets, the `audio` field will be automatically loaded:
+
 ```python
 {
   "audio": {
-    "array": [0.0, 0.1, -0.05, ...],  # Audio waveform as list
+    "array": array([0.0, 0.1, -0.05, ...], dtype=float32),  # numpy array
     "sampling_rate": 16000
   },
+  "audio_path": "audio/track-00001.wav",
   "duration": 55.44,
   "num_speakers": 3,
   "sampling_rate": 16000,
@@ -92,19 +106,19 @@ Each record in the Parquet dataset contains:
 
 ```python
 from datasets import load_dataset, Audio
-import numpy as np
 
-# Load from local Parquet files
-dataset = load_dataset("parquet", data_files="dataset/train-*.parquet", split="train")
+# Load from local files using dataset script
+dataset = load_dataset(".", data_files="dataset/metadata.jsonl", split="train")
 
 # Cast audio column to Audio feature for proper UI display and audio player
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
 # Or load from Hugging Face Hub (if uploaded)
-# Files are stored in the 'data' directory
-# dataset = load_dataset("your-username/diarization-dataset", data_dir="data")
-# dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+dataset = load_dataset("your-username/diarization-dataset")
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 ```
+
+**Note**: When loading from Hugging Face Hub, audio files are stored using Git LFS for efficient version control. The dataset script automatically handles loading audio files from the paths specified in the JSONL metadata.
 
 ### Accessing Audio and Metadata
 
@@ -112,14 +126,13 @@ dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 # Get a sample
 sample = dataset[0]
 
-# Access audio (now in dict format with 'array' and 'sampling_rate')
+# Access audio (after casting to Audio feature)
 audio_dict = sample["audio"]
-audio_array = np.array(audio_dict["array"], dtype=np.float32)  # numpy array
+audio_array = audio_dict["array"]  # numpy array (float32)
 sampling_rate = audio_dict["sampling_rate"]  # 16000
 
-# Or if Audio feature is cast, you can access directly:
-# audio_array = sample["audio"]["array"]  # Already a numpy array
-# sampling_rate = sample["audio"]["sampling_rate"]
+# Access audio file path
+audio_path = sample["audio_path"]  # "audio/track-00001.wav"
 
 # Access metadata
 duration = sample["duration"]
@@ -127,7 +140,7 @@ num_speakers = sample["num_speakers"]
 conversation_type = sample["conversation_type"]
 difficulty = sample["difficulty"]
 
-# Access speakers (already in structured format, not JSON string)
+# Access speakers (structured format)
 speakers = sample["speakers"]  # List of speaker segments
 ```
 
@@ -160,7 +173,8 @@ This dataset is generated using a modular Python script.
 │   ├── dataset/             # Source dataset loading and indexing
 │   ├── track/               # Track generation (planner, builder, generator)
 │   ├── patterns/            # Conversation patterns (Strategy pattern)
-│   └── storage/             # Storage utilities (Parquet writer, Hub uploader)
+│   └── storage/             # Storage utilities (file storage, Hub uploader)
+├── dataset_script.py        # Hugging Face dataset loading script
 ├── config.yaml              # Configuration file
 └── main.py                  # Entry point wrapper
 ```
@@ -175,8 +189,8 @@ uv sync
 This will install all required packages including:
 - `datasets[audio]` - Hugging Face datasets library
 - `soundfile` - Audio file I/O
-- `pyarrow` - Parquet file support
 - `pydantic` - Configuration validation
+- `huggingface_hub` - Hugging Face Hub integration
 - And more...
 
 ### Configuration
@@ -194,9 +208,8 @@ This will install all required packages including:
    - `track_count`: Number of tracks to generate
    - `dataset`: Dataset source configuration (path, language, split)
    - `output`: Output configuration:
-     - `path`: Output directory for Parquet files (used if `repo_id` is empty)
-     - `repo_id`: HuggingFace Hub repository ID (e.g., "username/dataset-name"). If set, dataset will be uploaded directly to Hub during generation. If empty, dataset will be saved to local Parquet files.
-     - `parquet_file_size_mb`: Maximum Parquet file size in MB
+     - `path`: Output directory for audio files and metadata (used if `repo_id` is empty)
+     - `repo_id`: HuggingFace Hub repository ID (e.g., "username/dataset-name"). If set, dataset will be uploaded directly to Hub during generation. If empty, dataset will be saved to local files.
    - `track`: Track generation parameters (duration range, pauses, short segments)
    - `speakers`: Speaker configuration (count, volumes, consecutive limits)
    - `overlaps`: Overlap probability and percentage ranges
@@ -224,7 +237,8 @@ The script will:
 
 1. **Direct upload to HuggingFace Hub** (recommended):
    - Set `output.repo_id` in `config.yaml` to your repository ID (e.g., `"username/dataset-name"`)
-   - Dataset will be uploaded **streamingly during generation** using batched Parquet uploads
+   - Dataset will be uploaded **streamingly during generation** as files are created
+   - Audio files are stored using Git LFS for efficient version control
    - No local files are created - saves disk space and time
    - Example:
      ```yaml
@@ -233,14 +247,23 @@ The script will:
        repo_id: "username/dataset-name"
      ```
 
-2. **Save to local Parquet files**:
+2. **Save to local files**:
    - Leave `output.repo_id` empty in `config.yaml`
-   - Dataset will be saved as Parquet files in the directory specified by `output.path`
+   - Dataset will be saved as WAV files in `audio/` directory and `metadata.jsonl` in the directory specified by `output.path`
    - Example:
      ```yaml
      output:
        path: "./dataset"
        repo_id: ""  # Empty = save locally
+     ```
+   - Output structure:
+     ```
+     dataset/
+     ├── audio/
+     │   ├── track-00001.wav
+     │   ├── track-00002.wav
+     │   └── ...
+     └── metadata.jsonl
      ```
 
 ## Citation

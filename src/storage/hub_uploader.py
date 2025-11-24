@@ -1,19 +1,14 @@
 """HuggingFace Hub streaming uploader."""
 
-import io
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
-import soundfile as sf
-from datasets import Audio, Features, Value
 from huggingface_hub import HfApi, create_repo, upload_folder
 
 from ..constants import SAMPLING_RATE
+from .file_storage import FileStorageWriter
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +21,6 @@ class HubUploader:
         repo_id: str,
         hf_token: str,
         private: bool = False,
-        batch_size: int = 100,
-        max_batch_size_mb: float = 100.0,
     ):
         """
         Initialize Hub uploader.
@@ -36,14 +29,10 @@ class HubUploader:
             repo_id: HuggingFace repository ID (format: "username/dataset-name").
             hf_token: HuggingFace authentication token.
             private: Whether the dataset should be private.
-            batch_size: Target number of examples per batch.
-            max_batch_size_mb: Maximum batch size in MB before uploading.
         """
         self.repo_id = repo_id
         self.hf_token = hf_token
         self.private = private
-        self.batch_size = batch_size
-        self.max_batch_size_bytes = max_batch_size_mb * 1024 * 1024
         self.hf_api = HfApi(token=hf_token)
         
         # Create repository if it doesn't exist
@@ -59,369 +48,92 @@ class HubUploader:
         except Exception as e:
             logger.warning(f"Could not create/verify repository: {e}")
 
-    def _convert_audio_bytes_to_audio(self, audio_bytes: bytes, sampling_rate: int) -> Dict[str, Any]:
-        """
-        Convert WAV bytes to audio array format expected by HuggingFace.
-
-        Args:
-            audio_bytes: Bytes of WAV file.
-            sampling_rate: Sampling rate of the audio.
-
-        Returns:
-            dict with 'array' and 'sampling_rate' keys.
-        """
-        wav_buffer = io.BytesIO(audio_bytes)
-        audio_array, sr = sf.read(wav_buffer)
-        wav_buffer.close()
-
-        # Ensure float32 format
-        if audio_array.dtype != np.float32:
-            audio_array = audio_array.astype(np.float32)
-
-        return {
-            "array": audio_array,  # Keep as numpy array for internal processing
-            "sampling_rate": sr if sr else sampling_rate,
-        }
-
-    def _convert_track_to_example(self, track: Dict[str, Any], convert_audio: bool = False) -> Dict[str, Any]:
-        """
-        Convert track metadata to HuggingFace dataset example format.
-
-        Args:
-            track: Track metadata dictionary.
-            convert_audio: Whether to convert audio bytes to dict format (for final dataset).
-                          If False, keeps audio as bytes (for Parquet).
-
-        Returns:
-            Example dictionary in HuggingFace format.
-        """
-        # For Parquet upload, keep audio as bytes
-        # For final dataset conversion, convert to Audio dict
-        if convert_audio and isinstance(track["audio"], bytes):
-            audio_data = self._convert_audio_bytes_to_audio(
-                track["audio"], track.get("sampling_rate", SAMPLING_RATE)
+    def _delete_existing_files(self) -> None:
+        """Delete existing files from repository."""
+        try:
+            files = self.hf_api.list_repo_files(
+                repo_id=self.repo_id,
+                repo_type="dataset",
             )
-        else:
-            audio_data = track["audio"]  # Keep as bytes for Parquet
-        
-        example = {
-            "audio": audio_data,
-            "duration": track["duration"],
-            "num_speakers": track["num_speakers"],
-            "sampling_rate": track["sampling_rate"],
-            "conversation_type": track["conversation_type"],
-            "difficulty": track["difficulty"],
-            "has_overlaps": track["has_overlaps"],
-            "has_simultaneous": track["has_simultaneous"],
-            "has_noise": track["has_noise"],
-            "speakers": track["speakers"],
-            "speaker_volumes": track.get("speaker_volumes", []),
-            "simultaneous_segments": track.get("simultaneous_segments", []),
-        }
+            
+            # Delete audio files and metadata
+            files_to_delete = [
+                f for f in files 
+                if f.endswith('.wav') or f == 'metadata.jsonl' or f.startswith('audio/')
+            ]
+            
+            if files_to_delete:
+                logger.info(f"Deleting {len(files_to_delete)} existing file(s) from repository...")
+                for file_path in files_to_delete:
+                    self.hf_api.delete_file(
+                        path_in_repo=file_path,
+                        repo_id=self.repo_id,
+                        repo_type="dataset",
+                        token=self.hf_token,
+                    )
+                logger.info(f"✓ Deleted {len(files_to_delete)} file(s)")
+            else:
+                logger.info("No existing files found in repository")
+        except Exception as e:
+            logger.warning(f"Could not delete existing files: {e}")
 
-        # Add optional fields
-        if "noise_type" in track:
-            example["noise_type"] = track["noise_type"]
-        if "snr" in track:
-            example["snr"] = track["snr"]
-
-        return example
-
-    def _get_features(self) -> Features:
-        """Get dataset features schema."""
-        from datasets import Sequence
-
-        speaker_struct = {
-            "speaker_id": Value("int64"),
-            "start": Value("float64"),
-            "end": Value("float64"),
-            "duration": Value("float64"),
-            "text": Value("string"),
-        }
-
-        simultaneous_struct = {
-            "start": Value("float64"),
-            "end": Value("float64"),
-            "speaker1_id": Value("int64"),
-            "speaker2_id": Value("int64"),
-            "duration": Value("float64"),
-        }
-
-        speaker_volume_struct = {
-            "speaker_id": Value("int64"),
-            "volume": Value("float64"),
-        }
-
-        features = Features({
-            "audio": Audio(sampling_rate=SAMPLING_RATE),
-            "duration": Value("float64"),
-            "num_speakers": Value("int64"),
-            "sampling_rate": Value("int64"),
-            "conversation_type": Value("string"),
-            "difficulty": Value("string"),
-            "has_overlaps": Value("bool"),
-            "has_simultaneous": Value("bool"),
-            "has_noise": Value("bool"),
-            "speakers": Sequence(speaker_struct),
-            "speaker_volumes": Sequence(speaker_volume_struct),
-            "simultaneous_segments": Sequence(simultaneous_struct),
-            "noise_type": Value("string"),
-            "snr": Value("float64"),
-        })
-
-        return features
-
-    def _create_parquet_schema(self) -> pa.Schema:
-        """Create Parquet schema for batch upload."""
-        speaker_struct = pa.struct([
-            ("speaker_id", pa.int64()),
-            ("start", pa.float64()),
-            ("end", pa.float64()),
-            ("duration", pa.float64()),
-            ("text", pa.string()),
-        ])
-        
-        simultaneous_struct = pa.struct([
-            ("start", pa.float64()),
-            ("end", pa.float64()),
-            ("speaker1_id", pa.int64()),
-            ("speaker2_id", pa.int64()),
-            ("duration", pa.float64()),
-        ])
-        
-        speaker_volume_struct = pa.struct([
-            ("speaker_id", pa.int64()),
-            ("volume", pa.float64()),
-        ])
-        
-        # Audio struct for dict format expected by HuggingFace Audio feature
-        audio_struct = pa.struct([
-            ("array", pa.list_(pa.float32())),  # Audio array as list of floats
-            ("sampling_rate", pa.int64()),
-        ])
-
-        return pa.schema([
-            ("audio", audio_struct),  # Store as structured data for Hugging Face Audio feature
-            ("duration", pa.float64()),
-            ("num_speakers", pa.int64()),
-            ("sampling_rate", pa.int64()),
-            ("conversation_type", pa.string()),
-            ("difficulty", pa.string()),
-            ("has_overlaps", pa.bool_()),
-            ("has_simultaneous", pa.bool_()),
-            ("has_noise", pa.bool_()),
-            ("speakers", pa.list_(speaker_struct)),
-            ("noise_type", pa.string()),
-            ("snr", pa.float64()),
-            ("speaker_volumes", pa.list_(speaker_volume_struct)),
-            ("simultaneous_segments", pa.list_(simultaneous_struct)),
-        ])
-
-    def _create_parquet_batch(self, batch: list[Dict[str, Any]], schema: pa.Schema) -> bytes:
+    def _create_gitattributes(self, output_dir: Path) -> None:
         """
-        Create Parquet file in memory from batch of examples.
+        Create .gitattributes file for Git LFS support.
         
         Args:
-            batch: List of example dictionaries.
-            schema: Parquet schema.
-            
-        Returns:
-            Parquet file as bytes.
+            output_dir: Directory where to create .gitattributes.
         """
-        # Convert examples to Parquet format
-        speakers_list = []
-        speaker_volumes_list = []
-        simultaneous_segments_list = []
-        
-        for example in batch:
-            # Speakers
-            speakers_data = example.get("speakers", [])
-            speakers_structs = [
-                {
-                    "speaker_id": s["speaker_id"],
-                    "start": s["start"],
-                    "end": s["end"],
-                    "duration": s["duration"],
-                    "text": s.get("text", ""),
-                }
-                for s in speakers_data
-            ]
-            speakers_list.append(speakers_structs)
-            
-            # Speaker volumes
-            volumes_data = example.get("speaker_volumes", [])
-            if isinstance(volumes_data, dict):
-                volumes_data = [
-                    {"speaker_id": int(sid), "volume": float(vol)}
-                    for sid, vol in volumes_data.items()
-                ]
-            speaker_volumes_list.append(volumes_data)
-            
-            # Simultaneous segments
-            sim_data = example.get("simultaneous_segments", [])
-            simultaneous_segments_list.append(sim_data)
-        
-        # Audio - convert to dict format expected by HuggingFace Audio feature
-        audio_list = []
-        for example in batch:
-            audio_data = example.get("audio")
-            if isinstance(audio_data, bytes):
-                # Convert raw WAV bytes to array format for Hugging Face
-                audio_dict = self._convert_audio_bytes_to_audio(
-                    audio_data, example.get("sampling_rate", SAMPLING_RATE)
-                )
-                audio_list.append({
-                    "array": audio_dict["array"].tolist(),  # Convert to list for Parquet
-                    "sampling_rate": audio_dict["sampling_rate"],
-                })
-            else:
-                # Fallback
-                audio_list.append({
-                    "array": [],
-                    "sampling_rate": example.get("sampling_rate", SAMPLING_RATE),
-                })
-
-        arrays = {
-            "audio": audio_list,  # Now using raw bytes as expected by Hugging Face
-            "duration": [e["duration"] for e in batch],
-            "num_speakers": [e["num_speakers"] for e in batch],
-            "sampling_rate": [e["sampling_rate"] for e in batch],
-            "conversation_type": [e["conversation_type"] for e in batch],
-            "difficulty": [e["difficulty"] for e in batch],
-            "has_overlaps": [e["has_overlaps"] for e in batch],
-            "has_simultaneous": [e["has_simultaneous"] for e in batch],
-            "has_noise": [e["has_noise"] for e in batch],
-            "speakers": speakers_list,
-            "noise_type": [e.get("noise_type") for e in batch],
-            "snr": [e.get("snr") for e in batch],
-            "speaker_volumes": speaker_volumes_list,
-            "simultaneous_segments": simultaneous_segments_list,
-        }
-        
-        table = pa.table(arrays, schema=schema)
-        
-        # Write to bytes buffer
-        buffer = io.BytesIO()
-        pq.write_table(
-            table,
-            buffer,
-            compression="zstd",
-            compression_level=9,
-            row_group_size=1000,
-            use_dictionary=True,
-        )
-        return buffer.getvalue()
+        gitattributes_path = output_dir / ".gitattributes"
+        with open(gitattributes_path, "w", encoding="utf-8") as f:
+            f.write("*.wav filter=lfs diff=lfs merge=lfs -text\n")
+        logger.debug("Created .gitattributes for Git LFS")
 
     def upload_streaming(self, tracks_iterator: Iterator[Dict[str, Any]]) -> None:
         """
-        Upload tracks to HuggingFace Hub in streaming mode using batched Parquet uploads.
+        Upload tracks to HuggingFace Hub in streaming mode.
 
         Args:
             tracks_iterator: Iterator of track metadata dictionaries.
         """
+        # Delete existing files before uploading new ones
+        self._delete_existing_files()
+        
         logger.info(f"Starting streaming upload to {self.repo_id}...")
-        logger.info("Using batched Parquet upload for memory efficiency")
+        logger.info("Using file-based storage with Git LFS for audio files")
 
-        schema = self._create_parquet_schema()
-        current_batch = []
-        current_size = 0
-        file_index = 0
-        total_tracks = 0
-        
-        # Batch commits to avoid rate limits: upload multiple files per commit
-        # This reduces disk usage (only one batch at a time) and avoids 429 errors
-        commit_batch_size = 20  # Upload 20 files per commit (well below 128/hour limit)
-        files_in_current_commit = []  # List of (bytes, filename) tuples
-        
-        for track in tracks_iterator:
-                try:
-                    # For the new approach, we keep audio as raw bytes
-                    # Just prepare metadata structure without audio conversion
-                    example = {
-                        "audio": track["audio"],  # Keep as raw WAV bytes
-                        "duration": track["duration"],
-                        "num_speakers": track["num_speakers"],
-                        "sampling_rate": track["sampling_rate"],
-                        "conversation_type": track["conversation_type"],
-                        "difficulty": track["difficulty"],
-                        "has_overlaps": track["has_overlaps"],
-                        "has_simultaneous": track["has_simultaneous"],
-                        "has_noise": track["has_noise"],
-                        "speakers": track["speakers"],
-                        "speaker_volumes": track.get("speaker_volumes", []),
-                        "simultaneous_segments": track.get("simultaneous_segments", []),
-                    }
-
-                    # Add optional fields
-                    if "noise_type" in track:
-                        example["noise_type"] = track["noise_type"]
-                    if "snr" in track:
-                        example["snr"] = track["snr"]
-
-                    # Estimate size based on raw audio bytes
-                    audio_data = track["audio"]
-                    if isinstance(audio_data, bytes):
-                        estimated_size = len(audio_data) + 2000  # Metadata overhead
-                    else:
-                        estimated_size = 50000  # Fallback estimate
-                    
-                    # Check if we need to save current batch to file
-                    if current_batch and (current_size + estimated_size) > self.max_batch_size_bytes:
-                        # Create Parquet batch
-                        parquet_bytes = self._create_parquet_batch(current_batch, schema)
-                        filename = f"train-{file_index:05d}.parquet"
-                        
-                        # Store bytes in memory (add to commit batch)
-                        files_in_current_commit.append((parquet_bytes, filename))
-                        
-                        # Upload commit batch when it reaches the limit
-                        if len(files_in_current_commit) >= commit_batch_size:
-                            # file_index will be incremented after this, so current value is the next file index
-                            # Start index = current file_index - number of files in batch
-                            start_file_index = file_index - len(files_in_current_commit) + 1
-                            self._upload_commit_batch(files_in_current_commit, start_file_index, total_tracks)
-                            files_in_current_commit = []
-                        
-                        logger.info(f"  Prepared batch {file_index + 1}: {len(current_batch)} tracks, {len(parquet_bytes) / (1024*1024):.2f} MB")
-                        
-                        file_index += 1
-                        current_batch = []
-                        current_size = 0
-                    
-                    # Add to current batch
-                    current_batch.append(example)
-                    current_size += estimated_size
-                    total_tracks += 1
-                    
-                    if total_tracks % 100 == 0:
-                        logger.info(f"  Processed {total_tracks} tracks...")
-                        
-                except Exception as e:
-                    logger.error(f"Failed to process track: {e}")
-                    continue
+        # Create temporary directory for file storage
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
             
-        # Save remaining batch
-        if current_batch:
-            parquet_bytes = self._create_parquet_batch(current_batch, schema)
-            filename = f"train-{file_index:05d}.parquet"
+            # Use FileStorageWriter to write files
+            writer = FileStorageWriter(output_dir=temp_path)
+            total_tracks = writer.write_tracks_incremental(tracks_iterator)
             
-            files_in_current_commit.append((parquet_bytes, filename))
+            if total_tracks == 0:
+                logger.warning("No tracks to upload")
+                return
             
-            logger.info(f"  Prepared final batch {file_index + 1}: {len(current_batch)} tracks, {len(parquet_bytes) / (1024*1024):.2f} MB")
-            file_index += 1
+            # Create .gitattributes for Git LFS
+            self._create_gitattributes(temp_path)
+            
+            # Upload entire directory structure
+            logger.info(f"\nUploading {total_tracks} tracks to HuggingFace Hub...")
+            logger.info("This may take a while for large datasets...")
+            
+            upload_folder(
+                folder_path=str(temp_path),
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                token=self.hf_token,
+                commit_message=f"Upload dataset: {total_tracks} tracks",
+            )
+            
+            logger.info(f"✓ Uploaded {total_tracks} tracks")
         
-        total_files = file_index
-        
-        # Upload remaining files in commit batch
-        if files_in_current_commit:
-            # file_index was already incremented after adding the last file
-            # Start index = current file_index - number of files in batch
-            start_file_index = file_index - len(files_in_current_commit)
-            self._upload_commit_batch(files_in_current_commit, start_file_index, total_tracks)
-        
-        # Upload README in final commit
+        # Upload README in separate commit
         logger.info("Creating dataset card...")
-        readme_content = self._create_dataset_card_content(total_files, total_tracks)
+        readme_content = self._create_dataset_card_content(total_tracks)
         self.hf_api.upload_file(
             path_or_fileobj=readme_content.encode("utf-8"),
             path_in_repo="README.md",
@@ -431,42 +143,10 @@ class HubUploader:
             commit_message="Update dataset card",
         )
         
-        logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks in {total_files} file(s) to {self.repo_id}")
+        logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks to {self.repo_id}")
         logger.info(f"  View at: https://huggingface.co/datasets/{self.repo_id}")
 
-    def _upload_commit_batch(self, files_list: list, start_file_index: int, total_tracks_so_far: int) -> None:
-        """
-        Upload a batch of files in a single commit.
-        
-        Args:
-            files_list: List of (bytes, filename) tuples
-            start_file_index: Starting file index for this batch
-            total_tracks_so_far: Total tracks processed so far
-        """
-        # Create temporary directory and write files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            data_dir = temp_path / "data"
-            data_dir.mkdir(exist_ok=True)
-            
-            # Write all files to temporary directory
-            for parquet_bytes, filename in files_list:
-                filepath = data_dir / filename
-                with open(filepath, "wb") as f:
-                    f.write(parquet_bytes)
-            
-            # Upload all files in this batch as a single commit
-            logger.info(f"\nUploading batch of {len(files_list)} file(s) (files {start_file_index}-{start_file_index + len(files_list) - 1})...")
-            upload_folder(
-                folder_path=str(temp_path),
-                repo_id=self.repo_id,
-                repo_type="dataset",
-                token=self.hf_token,
-                commit_message=f"Upload batch: {len(files_list)} Parquet file(s) ({total_tracks_so_far} tracks so far)",
-            )
-            logger.info(f"  ✓ Uploaded {len(files_list)} file(s) in single commit")
-
-    def _create_dataset_card_content(self, num_files: int, num_tracks: int) -> str:
+    def _create_dataset_card_content(self, num_tracks: int) -> str:
         """Create dataset card README content."""
         return f"""---
 license: mit
@@ -487,12 +167,23 @@ Synthetic speech diarization dataset.
 ## Dataset Details
 
 - **Number of tracks**: {num_tracks}
-- **Number of Parquet files**: {num_files}
 - **Sampling rate**: {SAMPLING_RATE} Hz
+- **Audio format**: WAV (16-bit PCM)
+- **Storage**: Audio files with JSONL metadata
 
 ## Dataset Structure
 
 The dataset contains audio tracks with speaker diarization annotations.
+
+### Directory Structure
+
+```
+audio/
+  track-00001.wav
+  track-00002.wav
+  ...
+metadata.jsonl
+```
 
 ### Features
 
@@ -513,9 +204,18 @@ The dataset contains audio tracks with speaker diarization annotations.
 from datasets import load_dataset, Audio
 
 # Load dataset from HuggingFace Hub
-# Files are stored in the 'data' directory
-dataset = load_dataset("{self.repo_id}", data_dir="data")
+dataset = load_dataset("{self.repo_id}")
 dataset = dataset.cast_column("audio", Audio(sampling_rate={SAMPLING_RATE}))
-```
-"""
 
+# Access a sample
+sample = dataset[0]
+print(f"Duration: {{sample['duration']}}s")
+print(f"Speakers: {{sample['num_speakers']}}")
+```
+
+## Notes
+
+- Audio files are stored using Git LFS for efficient version control
+- Metadata is stored in JSONL format (one JSON object per line)
+- Each track has a unique sequential identifier (track-00001, track-00002, etc.)
+"""

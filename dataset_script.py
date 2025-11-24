@@ -1,32 +1,89 @@
 """Dataset script for Hugging Face dataset with Audio feature support."""
 
-import numpy as np
+import json
+from pathlib import Path
+
 from datasets import Audio, DatasetInfo, Features, Value, Sequence
-from datasets.data_files import DataFilesDict
-import pyarrow.parquet as pq
 
 
 def _generate_examples(files):
-    """Generate examples from Parquet files."""
+    """
+    Generate examples from JSONL metadata file and audio files.
+    
+    Args:
+        files: List of file paths. Should contain metadata.jsonl file.
+    
+    Yields:
+        Tuple of (example_id, example_dict)
+    """
+    # Find metadata.jsonl file
+    metadata_file = None
+    base_path = None
+    
     for filepath in files:
-        table = pq.read_table(filepath)
-        for i in range(len(table)):
-            example = {}
-            for column_name in table.column_names:
-                value = table[column_name][i].as_py()
-                
-                # Convert audio struct to dict format with numpy array
-                if column_name == "audio" and isinstance(value, dict):
-                    # Value is in dict format with "array" (list) and "sampling_rate"
-                    # Convert list back to numpy array for Audio feature
-                    example[column_name] = {
-                        "array": np.array(value["array"], dtype=np.float32),
-                        "sampling_rate": value["sampling_rate"],
-                    }
-                else:
-                    example[column_name] = value
+        path = Path(filepath)
+        if path.name == "metadata.jsonl":
+            metadata_file = path
+            base_path = path.parent
+            break
+    
+    if metadata_file is None:
+        raise ValueError("metadata.jsonl file not found in provided files")
+    
+    # Read JSONL file line by line
+    with open(metadata_file, "r", encoding="utf-8") as f:
+        for example_id, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
             
-            yield i, example
+            try:
+                metadata = json.loads(line)
+                
+                # Get audio path from metadata
+                audio_path = metadata.get("audio_path")
+                if not audio_path:
+                    continue
+                
+                # Resolve audio file path relative to metadata file location
+                if base_path:
+                    audio_file = base_path / audio_path
+                else:
+                    audio_file = Path(audio_path)
+                
+                # Check if audio file exists
+                if not audio_file.exists():
+                    continue
+                
+                # Create example dictionary
+                # Always include all fields to match the schema, using None or defaults for optional fields
+                example = {
+                    "audio": str(audio_file),  # Audio feature will load from path
+                    "audio_path": audio_path,  # Relative path from metadata
+                    "duration": metadata.get("duration"),
+                    "num_speakers": metadata.get("num_speakers"),
+                    "sampling_rate": metadata.get("sampling_rate", 16000),
+                    "conversation_type": metadata.get("conversation_type"),
+                    "difficulty": metadata.get("difficulty"),
+                    "has_overlaps": metadata.get("has_overlaps", False),
+                    "has_simultaneous": metadata.get("has_simultaneous", False),
+                    "has_noise": metadata.get("has_noise", False),
+                    "speakers": metadata.get("speakers", []),
+                    # Optional fields - always include with None or defaults
+                    "noise_type": metadata.get("noise_type"),
+                    "snr": metadata.get("snr"),
+                    "speaker_volumes": metadata.get("speaker_volumes", []),
+                    "simultaneous_segments": metadata.get("simultaneous_segments", []),
+                }
+                
+                yield example_id, example
+                
+            except json.JSONDecodeError:
+                # Skip invalid JSON lines
+                continue
+            except Exception:
+                # Skip examples with errors
+                continue
 
 
 def _info() -> DatasetInfo:
@@ -54,6 +111,7 @@ def _info() -> DatasetInfo:
     
     features = Features({
         "audio": Audio(sampling_rate=16000),
+        "audio_path": Value("string"),
         "duration": Value("float64"),
         "num_speakers": Value("int64"),
         "sampling_rate": Value("int64"),
@@ -70,4 +128,3 @@ def _info() -> DatasetInfo:
     })
     
     return DatasetInfo(features=features)
-

@@ -14,8 +14,8 @@ from .constants import SAMPLING_RATE
 from .dataset.indexer import DatasetIndexer
 from .dataset.loader import DatasetLoader
 from .patterns.selector import PatternSelector
+from .storage.file_storage import FileStorageWriter
 from .storage.hub_uploader import HubUploader
-from .storage.parquet import ParquetWriter
 from .track.generator import TrackGenerator
 
 # Configure logging
@@ -236,18 +236,15 @@ def main() -> None:
         logger.info(f"Dataset available at: https://huggingface.co/datasets/{config.output.repo_id}")
         logger.info("=" * 60)
     else:
-        # Write tracks incrementally to Parquet files
+        # Write tracks incrementally to files
         output_dir = Path(config.output.path)
-        writer = ParquetWriter(
-            output_dir=output_dir,
-            max_file_size_mb=config.output.parquet_file_size_mb,
-        )
-        total_files = writer.write_tracks_incremental(track_generator())
+        writer = FileStorageWriter(output_dir=output_dir)
+        total_tracks = writer.write_tracks_incremental(track_generator())
 
         logger.info("\n" + "=" * 60)
         logger.info("Generation complete!")
-        logger.info(f"Written {total_files} Parquet file(s)")
-        logger.info(f"Parquet files: {output_dir.absolute()}")
+        logger.info(f"Written {total_tracks} track(s)")
+        logger.info(f"Output directory: {output_dir.absolute()}")
         logger.info("=" * 60)
 
 

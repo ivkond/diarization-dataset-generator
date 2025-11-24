@@ -15,7 +15,6 @@ dataset:
 output:
   path: "./dataset"
   repo_id: "ivkond/synthetic-speech-diarization-ru"
-  parquet_file_size_mb: 500
 
 # Track structure
 track:
