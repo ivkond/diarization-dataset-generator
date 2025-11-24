@@ -1,17 +1,21 @@
 """HuggingFace Hub streaming uploader."""
 
+import json
 import logging
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
-from huggingface_hub import HfApi, create_repo, upload_folder
+from huggingface_hub import HfApi, CommitOperationAdd, create_commit, create_repo, upload_file, upload_folder
 
 from ..constants import SAMPLING_RATE
 from .file_storage import FileStorageWriter
 
 logger = logging.getLogger(__name__)
+
+# Batch size for uploading files (upload in batches to reduce API calls)
+UPLOAD_BATCH_SIZE = 50
 
 
 class HubUploader:
@@ -92,7 +96,8 @@ class HubUploader:
 
     def upload_streaming(self, tracks_iterator: Iterator[Dict[str, Any]]) -> None:
         """
-        Upload tracks to HuggingFace Hub in streaming mode.
+        Upload tracks to HuggingFace Hub in streaming mode with batch processing.
+        Audio files are deleted in batches immediately after successful upload to save disk space.
 
         Args:
             tracks_iterator: Iterator of track metadata dictionaries.
@@ -102,47 +107,248 @@ class HubUploader:
         
         logger.info(f"Starting streaming upload to {self.repo_id}...")
         logger.info("Using file-based storage with Git LFS for audio files")
+        logger.info(f"Uploading in batches of {UPLOAD_BATCH_SIZE} files for efficiency")
+        logger.info("Audio files will be deleted in batches after upload to save disk space")
 
         # Create temporary directory for file storage
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             
-            # Use FileStorageWriter to write files
-            writer = FileStorageWriter(output_dir=temp_path)
-            total_tracks = writer.write_tracks_incremental(tracks_iterator)
+            # Create audio subdirectory
+            audio_dir = temp_path / "audio"
+            audio_dir.mkdir(exist_ok=True)
+            
+            # Metadata file path
+            metadata_file = temp_path / "metadata.jsonl"
+            
+            # Create .gitattributes for Git LFS
+            self._create_gitattributes(temp_path)
+            
+            # Upload .gitattributes first
+            self.hf_api.upload_file(
+                path_or_fileobj=str(temp_path / ".gitattributes"),
+                path_in_repo=".gitattributes",
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                token=self.hf_token,
+                commit_message=None,  # Will commit at the end
+            )
+            
+            # Track counter and batch tracking
+            track_counter = 0
+            total_tracks = 0
+            batch_num = 0  # Current batch number
+            batch_files = []  # List of (audio_path, relative_path) tuples for current batch
+            batch_metadata = []  # List of metadata dicts for current batch
+            
+            # Create a writer instance for metadata preparation (reused for all tracks)
+            temp_writer = FileStorageWriter(output_dir=temp_path)
+            
+            def upload_batch(batch_num: int, batch_files_list: list, batch_metadata_list: list):
+                """
+                Upload a batch of files in a single commit and delete them.
+                
+                Returns:
+                    List of successfully uploaded metadata entries (to write to JSONL).
+                """
+                if not batch_files_list:
+                    return []
+                
+                successfully_uploaded_metadata = []
+                successfully_uploaded_files = []  # Track which files were successfully uploaded
+                commit_operations = []  # Accumulate operations for batch commit
+                
+                try:
+                    # Prepare commit operations for all files in the batch
+                    for idx, (audio_path, relative_path) in enumerate(batch_files_list):
+                        try:
+                            # Create commit operation (doesn't upload yet)
+                            operation = CommitOperationAdd(
+                                path_in_repo=relative_path,
+                                path_or_fileobj=str(audio_path),
+                            )
+                            commit_operations.append(operation)
+                            # Track files and metadata for successful operations
+                            successfully_uploaded_files.append(audio_path)
+                            successfully_uploaded_metadata.append(batch_metadata_list[idx])
+                        except Exception as e:
+                            logger.error(f"Failed to prepare {relative_path} for batch {batch_num}: {e}")
+                            # Continue with other files in batch
+                    
+                    # Create a single commit for all files in the batch
+                    if commit_operations:
+                        try:
+                            self.hf_api.create_commit(
+                                repo_id=self.repo_id,
+                                repo_type="dataset",
+                                operations=commit_operations,
+                                commit_message=f"Upload batch {batch_num}: {len(commit_operations)} files",
+                                token=self.hf_token,
+                            )
+                            uploaded_count = len(commit_operations)
+                            
+                            # Delete only successfully uploaded files to prevent data loss
+                            deleted_count = 0
+                            for audio_path in successfully_uploaded_files:
+                                if audio_path.exists():
+                                    try:
+                                        audio_path.unlink()
+                                        deleted_count += 1
+                                    except Exception as e:
+                                        logger.warning(f"Failed to delete {audio_path}: {e}")
+                            
+                            logger.info(f"  Batch {batch_num}: Uploaded {uploaded_count}/{len(batch_files_list)} files in single commit, deleted {deleted_count} files")
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to commit batch {batch_num}: {e}")
+                            # Don't delete files if commit failed - they may be retried
+                            successfully_uploaded_metadata = []  # No files were actually uploaded
+                            successfully_uploaded_files = []
+                    else:
+                        logger.warning(f"  Batch {batch_num}: No files prepared for upload")
+                    
+                    # Log warning if some files failed to prepare (they remain on disk)
+                    failed_count = len(batch_files_list) - len(successfully_uploaded_files)
+                    if failed_count > 0:
+                        logger.warning(f"  Batch {batch_num}: {failed_count} file(s) failed to prepare and were NOT deleted to prevent data loss")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to upload batch {batch_num}: {e}")
+                    # Don't delete any files on batch-level error - they may be retried
+                    successfully_uploaded_metadata = []
+                    successfully_uploaded_files = []
+                
+                return successfully_uploaded_metadata
+            
+            # Process tracks: accumulate in batches, upload batch, delete batch
+            with open(metadata_file, "w", encoding="utf-8") as metadata_f:
+                for track in tracks_iterator:
+                    # Increment track_counter at the start to ensure unique filenames
+                    # even if this track is skipped due to errors
+                    current_track_id = track_counter
+                    track_counter += 1
+                    
+                    # Initialize audio_path before try block to ensure it's always defined
+                    # in the except handler, even if an exception occurs before assignment
+                    track_filename = f"track-{current_track_id:05d}.wav"
+                    audio_path = audio_dir / track_filename
+                    relative_audio_path = f"audio/{track_filename}"
+                    
+                    try:
+                        # Write audio file
+                        audio_bytes = track.get("audio")
+                        if not isinstance(audio_bytes, bytes):
+                            logger.error(f"Track {current_track_id}: audio is not bytes, skipping")
+                            continue
+                        
+                        with open(audio_path, "wb") as audio_f:
+                            audio_f.write(audio_bytes)
+                        
+                        # Add to current batch
+                        batch_files.append((audio_path, relative_audio_path))
+                        
+                        # Prepare metadata (remove audio bytes, add path)
+                        # Store metadata but don't write to JSONL yet - only after successful upload
+                        metadata = temp_writer._prepare_metadata(track, relative_audio_path)
+                        batch_metadata.append(metadata)
+                        
+                        # Upload batch when it reaches the batch size
+                        if len(batch_files) >= UPLOAD_BATCH_SIZE:
+                            batch_num += 1
+                            # Upload batch and get successfully uploaded metadata
+                            successfully_uploaded = upload_batch(batch_num, batch_files, batch_metadata)
+                            
+                            # Write metadata only for successfully uploaded files
+                            # Use try-finally to ensure batch is cleared even if metadata writing fails
+                            try:
+                                for uploaded_metadata in successfully_uploaded:
+                                    json_line = json.dumps(uploaded_metadata, ensure_ascii=False)
+                                    metadata_f.write(json_line + "\n")
+                                    total_tracks += 1
+                                
+                                metadata_f.flush()  # Ensure data is written immediately
+                            except Exception as e:
+                                logger.error(f"Failed to write metadata for batch {batch_num}: {e}")
+                                # Continue - batch will be cleared in finally block
+                            finally:
+                                # Always clear batch after upload (files are already deleted)
+                                # This prevents attempts to upload non-existent files
+                                batch_files = []
+                                batch_metadata = []
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to process track {current_track_id}: {e}")
+                        # Clean up audio file if it exists
+                        if audio_path.exists():
+                            audio_path.unlink()
+                        continue
+                
+                # Upload remaining files in the last incomplete batch
+                if batch_files:
+                    batch_num += 1
+                    # Upload batch and get successfully uploaded metadata
+                    successfully_uploaded = upload_batch(batch_num, batch_files, batch_metadata)
+                    
+                    # Write metadata only for successfully uploaded files
+                    # Use try-finally to ensure batch is cleared even if metadata writing fails
+                    try:
+                        for uploaded_metadata in successfully_uploaded:
+                            json_line = json.dumps(uploaded_metadata, ensure_ascii=False)
+                            metadata_f.write(json_line + "\n")
+                            total_tracks += 1
+                        
+                        metadata_f.flush()  # Ensure data is written immediately
+                    except Exception as e:
+                        logger.error(f"Failed to write metadata for final batch {batch_num}: {e}")
+                        # Continue - batch will be cleared in finally block
+                    finally:
+                        # Always clear batch after upload (files are already deleted)
+                        batch_files = []
+                        batch_metadata = []
             
             if total_tracks == 0:
                 logger.warning("No tracks to upload")
                 return
             
-            # Create .gitattributes for Git LFS
-            self._create_gitattributes(temp_path)
+            # Upload metadata.jsonl and dataset_script.py in a single commit
+            logger.info(f"Uploading metadata.jsonl and dataset_script.py...")
+            final_operations = []
             
-            # Copy dataset_script.py to temp directory for upload
-            # This allows Hugging Face to use the custom script instead of AudioFolder builder
+            # Add metadata.jsonl
+            final_operations.append(
+                CommitOperationAdd(
+                    path_in_repo="metadata.jsonl",
+                    path_or_fileobj=str(metadata_file),
+                )
+            )
+            
+            # Add dataset_script.py if it exists
             dataset_script_path = Path(__file__).parent.parent.parent / "dataset_script.py"
             if dataset_script_path.exists():
                 dest_script_path = temp_path / "dataset_script.py"
                 shutil.copy2(dataset_script_path, dest_script_path)
-                logger.info("Copied dataset_script.py to upload directory")
+                final_operations.append(
+                    CommitOperationAdd(
+                        path_in_repo="dataset_script.py",
+                        path_or_fileobj=str(dest_script_path),
+                    )
+                )
+                logger.info("Prepared dataset_script.py for upload")
             else:
                 logger.warning(f"dataset_script.py not found at {dataset_script_path}")
             
-            # Upload entire directory structure
-            logger.info(f"\nUploading {total_tracks} tracks to HuggingFace Hub...")
-            logger.info("This may take a while for large datasets...")
-            
-            upload_folder(
-                folder_path=str(temp_path),
-                repo_id=self.repo_id,
-                repo_type="dataset",
-                token=self.hf_token,
-                commit_message=f"Upload dataset: {total_tracks} tracks",
-            )
-            
-            logger.info(f"✓ Uploaded {total_tracks} tracks")
+            # Create commit for metadata and script
+            if final_operations:
+                self.hf_api.create_commit(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    operations=final_operations,
+                    commit_message=f"Add metadata.jsonl and dataset_script.py for {total_tracks} tracks",
+                    token=self.hf_token,
+                )
+                logger.info("Uploaded metadata.jsonl and dataset_script.py in single commit")
         
-        # Upload README in separate commit
+        # Upload README in separate commit (this will also trigger commit for previous files)
         logger.info("Creating dataset card...")
         readme_content = self._create_dataset_card_content(total_tracks)
         self.hf_api.upload_file(
@@ -151,7 +357,7 @@ class HubUploader:
             repo_id=self.repo_id,
             repo_type="dataset",
             token=self.hf_token,
-            commit_message="Update dataset card",
+            commit_message=f"Upload dataset: {total_tracks} tracks",
         )
         
         logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks to {self.repo_id}")
