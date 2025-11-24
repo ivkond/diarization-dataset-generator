@@ -1,6 +1,7 @@
 """HuggingFace Hub streaming uploader."""
 
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator
@@ -116,6 +117,16 @@ class HubUploader:
             
             # Create .gitattributes for Git LFS
             self._create_gitattributes(temp_path)
+            
+            # Copy dataset_script.py to temp directory for upload
+            # This allows Hugging Face to use the custom script instead of AudioFolder builder
+            dataset_script_path = Path(__file__).parent.parent.parent / "dataset_script.py"
+            if dataset_script_path.exists():
+                dest_script_path = temp_path / "dataset_script.py"
+                shutil.copy2(dataset_script_path, dest_script_path)
+                logger.info("Copied dataset_script.py to upload directory")
+            else:
+                logger.warning(f"dataset_script.py not found at {dataset_script_path}")
             
             # Upload entire directory structure
             logger.info(f"\nUploading {total_tracks} tracks to HuggingFace Hub...")
