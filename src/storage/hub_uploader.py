@@ -11,6 +11,7 @@ from huggingface_hub import HfApi, CommitOperationAdd, create_commit, create_rep
 
 from ..constants import SAMPLING_RATE
 from .file_storage import FileStorageWriter
+from .parquet import ParquetWriter
 
 logger = logging.getLogger(__name__)
 
@@ -372,7 +373,6 @@ class HubUploader:
 
             # Upload in batches to Parquet files
             total_files = parquet_writer.write_tracks_incremental(tracks_iterator)
-            total_tracks = sum(1 for _ in Path(temp_path).glob("*.parquet"))  # Actually count tracks in files
 
             # Count actual tracks by reading the parquet files
             total_tracks = 0
