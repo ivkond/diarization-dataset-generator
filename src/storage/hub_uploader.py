@@ -104,7 +104,7 @@ class HubUploader:
         """
         # Delete existing files before uploading new ones
         self._delete_existing_files()
-        
+
         logger.info(f"Starting streaming upload to {self.repo_id}...")
         logger.info("Using file-based storage with Git LFS for audio files")
         logger.info(f"Uploading in batches of {UPLOAD_BATCH_SIZE} files for efficiency")
@@ -113,17 +113,17 @@ class HubUploader:
         # Create temporary directory for file storage
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            
+
             # Create audio subdirectory
             audio_dir = temp_path / "audio"
             audio_dir.mkdir(exist_ok=True)
-            
+
             # Metadata file path
             metadata_file = temp_path / "metadata.jsonl"
-            
+
             # Create .gitattributes for Git LFS
             self._create_gitattributes(temp_path)
-            
+
             # Upload .gitattributes first
             self.hf_api.upload_file(
                 path_or_fileobj=str(temp_path / ".gitattributes"),
@@ -133,31 +133,31 @@ class HubUploader:
                 token=self.hf_token,
                 commit_message=None,  # Will commit at the end
             )
-            
+
             # Track counter and batch tracking
             track_counter = 0
             total_tracks = 0
             batch_num = 0  # Current batch number
             batch_files = []  # List of (audio_path, relative_path) tuples for current batch
             batch_metadata = []  # List of metadata dicts for current batch
-            
+
             # Create a writer instance for metadata preparation (reused for all tracks)
             temp_writer = FileStorageWriter(output_dir=temp_path)
-            
+
             def upload_batch(batch_num: int, batch_files_list: list, batch_metadata_list: list):
                 """
                 Upload a batch of files in a single commit and delete them.
-                
+
                 Returns:
                     List of successfully uploaded metadata entries (to write to JSONL).
                 """
                 if not batch_files_list:
                     return []
-                
+
                 successfully_uploaded_metadata = []
                 successfully_uploaded_files = []  # Track which files were successfully uploaded
                 commit_operations = []  # Accumulate operations for batch commit
-                
+
                 try:
                     # Prepare commit operations for all files in the batch
                     for idx, (audio_path, relative_path) in enumerate(batch_files_list):
@@ -174,7 +174,7 @@ class HubUploader:
                         except Exception as e:
                             logger.error(f"Failed to prepare {relative_path} for batch {batch_num}: {e}")
                             # Continue with other files in batch
-                    
+
                     # Create a single commit for all files in the batch
                     if commit_operations:
                         try:
@@ -186,7 +186,7 @@ class HubUploader:
                                 token=self.hf_token,
                             )
                             uploaded_count = len(commit_operations)
-                            
+
                             # Delete only successfully uploaded files to prevent data loss
                             deleted_count = 0
                             for audio_path in successfully_uploaded_files:
@@ -196,9 +196,9 @@ class HubUploader:
                                         deleted_count += 1
                                     except Exception as e:
                                         logger.warning(f"Failed to delete {audio_path}: {e}")
-                            
+
                             logger.info(f"  Batch {batch_num}: Uploaded {uploaded_count}/{len(batch_files_list)} files in single commit, deleted {deleted_count} files")
-                            
+
                         except Exception as e:
                             logger.error(f"Failed to commit batch {batch_num}: {e}")
                             # Don't delete files if commit failed - they may be retried
@@ -206,20 +206,20 @@ class HubUploader:
                             successfully_uploaded_files = []
                     else:
                         logger.warning(f"  Batch {batch_num}: No files prepared for upload")
-                    
+
                     # Log warning if some files failed to prepare (they remain on disk)
                     failed_count = len(batch_files_list) - len(successfully_uploaded_files)
                     if failed_count > 0:
                         logger.warning(f"  Batch {batch_num}: {failed_count} file(s) failed to prepare and were NOT deleted to prevent data loss")
-                    
+
                 except Exception as e:
                     logger.error(f"Failed to upload batch {batch_num}: {e}")
                     # Don't delete any files on batch-level error - they may be retried
                     successfully_uploaded_metadata = []
                     successfully_uploaded_files = []
-                
+
                 return successfully_uploaded_metadata
-            
+
             # Process tracks: accumulate in batches, upload batch, delete batch
             with open(metadata_file, "w", encoding="utf-8") as metadata_f:
                 for track in tracks_iterator:
@@ -227,37 +227,37 @@ class HubUploader:
                     # even if this track is skipped due to errors
                     current_track_id = track_counter
                     track_counter += 1
-                    
+
                     # Initialize audio_path before try block to ensure it's always defined
                     # in the except handler, even if an exception occurs before assignment
                     track_filename = f"track-{current_track_id:05d}.wav"
                     audio_path = audio_dir / track_filename
                     relative_audio_path = f"audio/{track_filename}"
-                    
+
                     try:
                         # Write audio file
                         audio_bytes = track.get("audio")
                         if not isinstance(audio_bytes, bytes):
                             logger.error(f"Track {current_track_id}: audio is not bytes, skipping")
                             continue
-                        
+
                         with open(audio_path, "wb") as audio_f:
                             audio_f.write(audio_bytes)
-                        
+
                         # Add to current batch
                         batch_files.append((audio_path, relative_audio_path))
-                        
+
                         # Prepare metadata (remove audio bytes, add path)
                         # Store metadata but don't write to JSONL yet - only after successful upload
                         metadata = temp_writer._prepare_metadata(track, relative_audio_path)
                         batch_metadata.append(metadata)
-                        
+
                         # Upload batch when it reaches the batch size
                         if len(batch_files) >= UPLOAD_BATCH_SIZE:
                             batch_num += 1
                             # Upload batch and get successfully uploaded metadata
                             successfully_uploaded = upload_batch(batch_num, batch_files, batch_metadata)
-                            
+
                             # Write metadata only for successfully uploaded files
                             # Use try-finally to ensure batch is cleared even if metadata writing fails
                             try:
@@ -265,7 +265,7 @@ class HubUploader:
                                     json_line = json.dumps(uploaded_metadata, ensure_ascii=False)
                                     metadata_f.write(json_line + "\n")
                                     total_tracks += 1
-                                
+
                                 metadata_f.flush()  # Ensure data is written immediately
                             except Exception as e:
                                 logger.error(f"Failed to write metadata for batch {batch_num}: {e}")
@@ -275,20 +275,20 @@ class HubUploader:
                                 # This prevents attempts to upload non-existent files
                                 batch_files = []
                                 batch_metadata = []
-                        
+
                     except Exception as e:
                         logger.error(f"Failed to process track {current_track_id}: {e}")
                         # Clean up audio file if it exists
                         if audio_path.exists():
                             audio_path.unlink()
                         continue
-                
+
                 # Upload remaining files in the last incomplete batch
                 if batch_files:
                     batch_num += 1
                     # Upload batch and get successfully uploaded metadata
                     successfully_uploaded = upload_batch(batch_num, batch_files, batch_metadata)
-                    
+
                     # Write metadata only for successfully uploaded files
                     # Use try-finally to ensure batch is cleared even if metadata writing fails
                     try:
@@ -296,7 +296,7 @@ class HubUploader:
                             json_line = json.dumps(uploaded_metadata, ensure_ascii=False)
                             metadata_f.write(json_line + "\n")
                             total_tracks += 1
-                        
+
                         metadata_f.flush()  # Ensure data is written immediately
                     except Exception as e:
                         logger.error(f"Failed to write metadata for final batch {batch_num}: {e}")
@@ -305,15 +305,15 @@ class HubUploader:
                         # Always clear batch after upload (files are already deleted)
                         batch_files = []
                         batch_metadata = []
-            
+
             if total_tracks == 0:
                 logger.warning("No tracks to upload")
                 return
-            
+
             # Upload metadata.jsonl and dataset_script.py in a single commit
-            logger.info(f"Uploading metadata.jsonl and dataset_script.py...")
+            logger.info(f"Uploading metadata.jsonl...")
             final_operations = []
-            
+
             # Add metadata.jsonl
             final_operations.append(
                 CommitOperationAdd(
@@ -321,36 +321,21 @@ class HubUploader:
                     path_or_fileobj=str(metadata_file),
                 )
             )
-            
-            # Add dataset_script.py if it exists
-            dataset_script_path = Path(__file__).parent.parent.parent / "dataset_script.py"
-            if dataset_script_path.exists():
-                dest_script_path = temp_path / "dataset_script.py"
-                shutil.copy2(dataset_script_path, dest_script_path)
-                final_operations.append(
-                    CommitOperationAdd(
-                        path_in_repo="dataset_script.py",
-                        path_or_fileobj=str(dest_script_path),
-                    )
-                )
-                logger.info("Prepared dataset_script.py for upload")
-            else:
-                logger.warning(f"dataset_script.py not found at {dataset_script_path}")
-            
-            # Create commit for metadata and script
+
+            # Create commit for metadata
             if final_operations:
                 self.hf_api.create_commit(
                     repo_id=self.repo_id,
                     repo_type="dataset",
                     operations=final_operations,
-                    commit_message=f"Add metadata.jsonl and dataset_script.py for {total_tracks} tracks",
+                    commit_message=f"Add metadata.jsonl for {total_tracks} tracks",
                     token=self.hf_token,
                 )
-                logger.info("Uploaded metadata.jsonl and dataset_script.py in single commit")
-        
+                logger.info("Uploaded metadata.jsonl")
+
         # Upload README in separate commit (this will also trigger commit for previous files)
         logger.info("Creating dataset card...")
-        readme_content = self._create_dataset_card_content(total_tracks)
+        readme_content = self._create_dataset_card_content(total_tracks, use_parquet_format=False)
         self.hf_api.upload_file(
             path_or_fileobj=readme_content.encode("utf-8"),
             path_in_repo="README.md",
@@ -359,13 +344,143 @@ class HubUploader:
             token=self.hf_token,
             commit_message=f"Upload dataset: {total_tracks} tracks",
         )
-        
+
         logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks to {self.repo_id}")
         logger.info(f"  View at: https://huggingface.co/datasets/{self.repo_id}")
 
-    def _create_dataset_card_content(self, num_tracks: int) -> str:
+    def upload_parquet_streaming(self, tracks_iterator: Iterator[Dict[str, Any]], max_file_size_mb: float = 100.0) -> None:
+        """
+        Upload tracks to HuggingFace Hub as Parquet files in streaming mode.
+        This method stores the audio data directly in the Parquet file instead of as separate files.
+
+        Args:
+            tracks_iterator: Iterator of track metadata dictionaries.
+            max_file_size_mb: Maximum size of each Parquet file in MB.
+        """
+        # Delete existing files before uploading new ones
+        self._delete_existing_files()
+
+        logger.info(f"Starting Parquet streaming upload to {self.repo_id}...")
+        logger.info(f"Using Parquet format with max file size {max_file_size_mb} MB")
+        logger.info("Converting audio bytes to array format for Parquet storage")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Initialize Parquet writer
+            parquet_writer = ParquetWriter(output_dir=temp_path, max_file_size_mb=max_file_size_mb)
+
+            # Upload in batches to Parquet files
+            total_files = parquet_writer.write_tracks_incremental(tracks_iterator)
+            total_tracks = sum(1 for _ in Path(temp_path).glob("*.parquet"))  # Actually count tracks in files
+
+            # Count actual tracks by reading the parquet files
+            total_tracks = 0
+            for parquet_file in temp_path.glob("*.parquet"):
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(parquet_file)
+                    total_tracks += table.num_rows
+                except:
+                    pass  # Skip files that can't be read
+
+            if total_tracks == 0:
+                logger.warning("No tracks to upload")
+                return
+
+            # Upload all Parquet files to Hub
+            logger.info(f"Uploading {total_files} Parquet file(s) containing {total_tracks} tracks...")
+            for parquet_file in temp_path.glob("*.parquet"):
+                self.hf_api.upload_file(
+                    path_or_fileobj=str(parquet_file),
+                    path_in_repo=parquet_file.name,
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    token=self.hf_token,
+                    commit_message=f"Upload Parquet file: {parquet_file.name}",
+                )
+                logger.info(f"  Uploaded {parquet_file.name}")
+
+        # Upload README in separate commit
+        logger.info("Creating dataset card...")
+        readme_content = self._create_dataset_card_content(total_tracks, use_parquet_format=True)
+        self.hf_api.upload_file(
+            path_or_fileobj=readme_content.encode("utf-8"),
+            path_in_repo="README.md",
+            repo_id=self.repo_id,
+            repo_type="dataset",
+            token=self.hf_token,
+            commit_message=f"Upload dataset: {total_tracks} tracks in Parquet format",
+        )
+
+        logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks to {self.repo_id} in Parquet format")
+        logger.info(f"  View at: https://huggingface.co/datasets/{self.repo_id}")
+
+    def _create_dataset_card_content(self, num_tracks: int, use_parquet_format: bool = False) -> str:
         """Create dataset card README content."""
-        return f"""---
+        if use_parquet_format:
+            return f"""---
+license: mit
+task_categories:
+- automatic-speech-recognition
+- audio-classification
+tags:
+- audio
+- speech
+- diarization
+- synthetic
+---
+
+# {self.repo_id.split('/')[-1]}
+
+Synthetic speech diarization dataset in Parquet format.
+
+## Dataset Details
+
+- **Number of tracks**: {num_tracks}
+- **Sampling rate**: {SAMPLING_RATE} Hz
+- **Audio format**: Embedded in Parquet files (Audio feature compatible)
+- **Storage**: Parquet format for efficient loading
+
+## Dataset Structure
+
+The dataset contains audio tracks with speaker diarization annotations, stored directly in Parquet format.
+
+### Features
+
+- `audio`: Audio waveform (Audio feature with array and sampling_rate)
+- `duration`: Track duration in seconds
+- `num_speakers`: Number of speakers in the track
+- `speakers`: List of speaker segments with timestamps and text
+- `speaker_volumes`: Speaker volume levels
+- `conversation_type`: Type of conversation (dialogue, monologue, etc.)
+- `difficulty`: Difficulty level (easy, medium, hard)
+- `has_overlaps`: Whether track contains overlapping speech
+- `has_simultaneous`: Whether track contains simultaneous speech
+- `has_noise`: Whether track contains background noise
+
+## Usage
+
+```python
+from datasets import load_dataset
+
+# Load dataset from HuggingFace Hub directly
+dataset = load_dataset("{self.repo_id}")
+
+# Access a sample
+sample = dataset[0]
+print(f"Duration: {{sample['duration']}}s")
+print(f"Speakers: {{sample['num_speakers']}}")
+```
+
+## Notes
+
+- Audio data is embedded directly in Parquet files for efficient streaming
+- No custom loading script required
+- Compatible with standard Hugging Face dataset operations
+"""
+        else:
+            return f"""---
 license: mit
 task_categories:
 - automatic-speech-recognition
@@ -436,3 +551,4 @@ print(f"Speakers: {{sample['num_speakers']}}")
 - Metadata is stored in JSONL format (one JSON object per line)
 - Each track has a unique sequential identifier (track-00001, track-00002, etc.)
 """
+

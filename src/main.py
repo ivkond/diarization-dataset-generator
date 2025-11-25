@@ -229,21 +229,26 @@ def main() -> None:
             hf_token=hf_token,
             private=False,  # Can be made configurable
         )
-        uploader.upload_streaming(track_generator())
-        
+
+        logger.info("Using Parquet format for upload")
+        uploader.upload_parquet_streaming(track_generator())
+
         logger.info("\n" + "=" * 60)
         logger.info("Generation and upload complete!")
         logger.info(f"Dataset available at: https://huggingface.co/datasets/{config.output.repo_id}")
         logger.info("=" * 60)
     else:
-        # Write tracks incrementally to files
+        # Write tracks incrementally to Parquet files
         output_dir = Path(config.output.path)
-        writer = FileStorageWriter(output_dir=output_dir)
+
+        logger.info("Writing dataset in Parquet format...")
+        from .storage.parquet import ParquetWriter
+        writer = ParquetWriter(output_dir=output_dir, max_file_size_mb=100.0)
         total_tracks = writer.write_tracks_incremental(track_generator())
+        logger.info(f"Written {total_tracks} track(s) in Parquet format")
 
         logger.info("\n" + "=" * 60)
         logger.info("Generation complete!")
-        logger.info(f"Written {total_tracks} track(s)")
         logger.info(f"Output directory: {output_dir.absolute()}")
         logger.info("=" * 60)
 
