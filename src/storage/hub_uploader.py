@@ -400,28 +400,31 @@ class HubUploader:
                     )
                 )
 
+            # Create README content and add to operations
+            logger.info("Creating dataset card...")
+            readme_content = self._create_dataset_card_content(total_tracks, use_parquet_format=True)
+            readme_path = temp_path / "README.md"
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(readme_content)
+
+            operations.append(
+                CommitOperationAdd(
+                    path_in_repo="README.md",
+                    path_or_fileobj=str(readme_path),
+                )
+            )
+
             if operations:
                 self.hf_api.create_commit(
                     repo_id=self.repo_id,
                     repo_type="dataset",
                     operations=operations,
-                    commit_message=f"Upload {total_files} Parquet files",
+                    commit_message=f"Upload {total_files} Parquet files and dataset card",
                     token=self.hf_token,
                 )
                 for parquet_file in temp_path.glob("*.parquet"):
                     logger.info(f"  Uploaded {parquet_file.name}")
-
-        # Upload README in separate commit
-        logger.info("Creating dataset card...")
-        readme_content = self._create_dataset_card_content(total_tracks, use_parquet_format=True)
-        self.hf_api.upload_file(
-            path_or_fileobj=readme_content.encode("utf-8"),
-            path_in_repo="README.md",
-            repo_id=self.repo_id,
-            repo_type="dataset",
-            token=self.hf_token,
-            commit_message=f"Upload dataset: {total_tracks} tracks in Parquet format",
-        )
+                logger.info("  Uploaded README.md")
 
         logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks to {self.repo_id} in Parquet format")
         logger.info(f"  View at: https://huggingface.co/datasets/{self.repo_id}")
