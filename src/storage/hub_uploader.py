@@ -388,18 +388,28 @@ class HubUploader:
                 logger.warning("No tracks to upload")
                 return
 
-            # Upload all Parquet files to Hub
+            # Upload all Parquet files to Hub in a single commit to avoid rate limiting
             logger.info(f"Uploading {total_files} Parquet file(s) containing {total_tracks} tracks...")
+
+            operations = []
             for parquet_file in temp_path.glob("*.parquet"):
-                self.hf_api.upload_file(
-                    path_or_fileobj=str(parquet_file),
-                    path_in_repo=parquet_file.name,
+                operations.append(
+                    CommitOperationAdd(
+                        path_in_repo=parquet_file.name,
+                        path_or_fileobj=str(parquet_file),
+                    )
+                )
+
+            if operations:
+                self.hf_api.create_commit(
                     repo_id=self.repo_id,
                     repo_type="dataset",
+                    operations=operations,
+                    commit_message=f"Upload {total_files} Parquet files",
                     token=self.hf_token,
-                    commit_message=f"Upload Parquet file: {parquet_file.name}",
                 )
-                logger.info(f"  Uploaded {parquet_file.name}")
+                for parquet_file in temp_path.glob("*.parquet"):
+                    logger.info(f"  Uploaded {parquet_file.name}")
 
         # Upload README in separate commit
         logger.info("Creating dataset card...")
