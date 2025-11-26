@@ -230,8 +230,8 @@ def main() -> None:
             private=False,  # Can be made configurable
         )
 
-        logger.info("Using Parquet format for upload")
-        uploader.upload_parquet_streaming(track_generator())
+        logger.info("Using upload_folder for upload")
+        uploader.upload_folder(track_generator())
 
         logger.info("\n" + "=" * 60)
         logger.info("Generation and upload complete!")

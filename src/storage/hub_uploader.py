@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
-from huggingface_hub import HfApi, CommitOperationAdd, create_commit, create_repo, upload_file, upload_folder
+from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete, create_commit, create_repo, upload_file, upload_folder
 
 from ..constants import SAMPLING_RATE
 from .file_storage import FileStorageWriter
@@ -55,33 +55,87 @@ class HubUploader:
             logger.warning(f"Could not create/verify repository: {e}")
 
     def _delete_existing_files(self) -> None:
-        """Delete existing files from repository."""
+        """Delete existing files from repository using batch operations."""
         try:
             files = self.hf_api.list_repo_files(
                 repo_id=self.repo_id,
                 repo_type="dataset",
             )
-            
-            # Delete audio files and metadata
+
+            # Get all files that need to be deleted - include more file types if needed
             files_to_delete = [
-                f for f in files 
-                if f.endswith('.wav') or f == 'metadata.jsonl' or f.startswith('audio/')
+                f for f in files
+                if (f.endswith('.wav') or
+                    f == 'metadata.jsonl' or
+                    f.startswith('audio/') or
+                    f.endswith('.parquet') or
+                    f.startswith('train-') or
+                    f == 'README.md' or
+                    f == '.gitattributes')
             ]
-            
+
             if files_to_delete:
-                logger.info(f"Deleting {len(files_to_delete)} existing file(s) from repository...")
-                for file_path in files_to_delete:
-                    self.hf_api.delete_file(
-                        path_in_repo=file_path,
-                        repo_id=self.repo_id,
-                        repo_type="dataset",
-                        token=self.hf_token,
-                    )
-                logger.info(f"✓ Deleted {len(files_to_delete)} file(s)")
+                logger.info(f"Deleting {len(files_to_delete)} existing file(s) from repository using batch operation...")
+
+                # Create delete operations for all files
+                delete_operations = [
+                    CommitOperationDelete(path_in_repo=file_path)
+                    for file_path in files_to_delete
+                ]
+
+                # Execute all deletions in a single commit
+                create_commit(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    operations=delete_operations,
+                    commit_message=f"Delete {len(files_to_delete)} existing files before dataset generation",
+                    token=self.hf_token,
+                )
+
+                logger.info(f"✓ Deleted {len(files_to_delete)} file(s) in batch operation")
             else:
                 logger.info("No existing files found in repository")
         except Exception as e:
-            logger.warning(f"Could not delete existing files: {e}")
+            # Fallback to individual deletion if batch deletion fails
+            logger.warning(f"Batch deletion failed: {e}, attempting individual file deletion...")
+            try:
+                files = self.hf_api.list_repo_files(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                )
+
+                files_to_delete = [
+                    f for f in files
+                    if (f.endswith('.wav') or
+                        f == 'metadata.jsonl' or
+                        f.startswith('audio/') or
+                        f.endswith('.parquet') or
+                        f.startswith('train-') or
+                        f == 'README.md' or
+                        f == '.gitattributes')
+                ]
+
+                if files_to_delete:
+                    logger.info(f"Fallback: Deleting {len(files_to_delete)} file(s) using batch operation...")
+
+                    # Create delete operations for all files
+                    delete_operations = [
+                        CommitOperationDelete(path_in_repo=file_path)
+                        for file_path in files_to_delete
+                    ]
+
+                    # Execute all deletions in a single commit
+                    create_commit(
+                        repo_id=self.repo_id,
+                        repo_type="dataset",
+                        operations=delete_operations,
+                        commit_message=f"Fallback: Delete {len(files_to_delete)} existing files before dataset generation",
+                        token=self.hf_token,
+                    )
+                    logger.info(f"✓ Fallback batch deletion completed: {len(files_to_delete)} file(s)")
+
+            except Exception as e2:
+                logger.warning(f"Could not delete existing files: {e2}")
 
     def _create_gitattributes(self, output_dir: Path) -> None:
         """
@@ -347,6 +401,65 @@ class HubUploader:
         )
 
         logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks to {self.repo_id}")
+        logger.info(f"  View at: https://huggingface.co/datasets/{self.repo_id}")
+
+    def upload_folder(self, tracks_iterator: Iterator[Dict[str, Any]], max_file_size_mb: float = 100.0) -> None:
+        """
+        Upload tracks to HuggingFace Hub using upload_folder method.
+        This method first creates the dataset files locally and then uploads the entire folder.
+
+        Args:
+            tracks_iterator: Iterator of track metadata dictionaries.
+            max_file_size_mb: Maximum size of each Parquet file in MB.
+        """
+        # Delete existing files before uploading new ones
+        self._delete_existing_files()
+
+        logger.info(f"Starting folder upload to {self.repo_id}...")
+        logger.info(f"Using Parquet format with max file size {max_file_size_mb} MB")
+        logger.info("Converting audio bytes to array format for Parquet storage")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Initialize Parquet writer
+            parquet_writer = ParquetWriter(output_dir=temp_path, max_file_size_mb=max_file_size_mb)
+
+            # Generate and write tracks to temporary directory
+            total_files = parquet_writer.write_tracks_incremental(tracks_iterator)
+
+            # Count actual tracks by reading the parquet files
+            total_tracks = 0
+            for parquet_file in temp_path.glob("*.parquet"):
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(parquet_file)
+                    total_tracks += table.num_rows
+                except:
+                    pass  # Skip files that can't be read
+
+            if total_tracks == 0:
+                logger.warning("No tracks to upload")
+                return
+
+            # Create README content
+            logger.info("Creating dataset card...")
+            readme_content = self._create_dataset_card_content(total_tracks, use_parquet_format=True)
+            readme_path = temp_path / "README.md"
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(readme_content)
+
+            # Upload the entire folder using upload_folder
+            logger.info(f"Uploading entire folder to {self.repo_id}...")
+            upload_folder(
+                repo_id=self.repo_id,
+                folder_path=temp_path,
+                repo_type="dataset",
+                token=self.hf_token,
+                commit_message=f"Upload dataset: {total_tracks} tracks using upload_folder",
+            )
+
+        logger.info(f"\n✓ Successfully uploaded {total_tracks} tracks to {self.repo_id} using upload_folder")
         logger.info(f"  View at: https://huggingface.co/datasets/{self.repo_id}")
 
     def upload_parquet_streaming(self, tracks_iterator: Iterator[Dict[str, Any]], max_file_size_mb: float = 100.0) -> None:
