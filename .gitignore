@@ -1,1 +1,28 @@
-Nothing should be ignored based on the provided file changes. The changes only include source/config files (`config.yaml`, `src/main.py`) with no build artifacts, dependencies, or temporary files that need to be ignored.
+```
+# Compiled and build artifacts
+*.pyc
+__pycache__/
+*.o
+*.obj
+dist/
+build/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Editors
+.vscode/
+.idea/
+```
