@@ -13,7 +13,7 @@ dataset:
 
 # Output configuration
 output:
-  path: "./dataset"
+  path: "./data"
   repo_id: "ivkond/synthetic-speech-diarization-ru"
 
 # Track structure
@@ -43,13 +43,13 @@ speakers:
 
 # Overlaps configuration
 overlaps:
-  probability: 0.3
+  probability: 0.0  # Set to 0 to remove overlaps
   min_percent: 0.1
   max_percent: 0.3
 
 # Simultaneous speech
 simultaneous_speech:
-  probability: 0.25
+  probability: 0.0  # Set to 0 to remove simultaneous speech
   min_duration: 0.5
   max_duration: 3.0
 
@@ -70,10 +70,9 @@ noise:
 
 # Conversation patterns (probabilities should sum to 1.0)
 conversation_patterns:
-  dialogue: 0.4
-  monologue: 0.2
-  group_discussion: 0.2
-  interview: 0.2
+  dialogue: 0.33
+  monologue: 0.33
+  interview: 0.34
 
 # Difficulty distribution (probabilities should sum to 1.0)
 difficulty_distribution:

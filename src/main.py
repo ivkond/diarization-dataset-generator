@@ -238,14 +238,14 @@ def main() -> None:
         logger.info(f"Dataset available at: https://huggingface.co/datasets/{config.output.repo_id}")
         logger.info("=" * 60)
     else:
-        # Write tracks incrementally to Parquet files
+        # Write tracks as WAV files and JSONL metadata
         output_dir = Path(config.output.path)
 
-        logger.info("Writing dataset in Parquet format...")
-        from .storage.parquet import ParquetWriter
-        writer = ParquetWriter(output_dir=output_dir, max_file_size_mb=100.0)
+        logger.info("Writing dataset as WAV files and JSONL metadata...")
+        from .storage.file_storage import FileStorageWriter
+        writer = FileStorageWriter(output_dir=output_dir)
         total_tracks = writer.write_tracks_incremental(track_generator())
-        logger.info(f"Written {total_tracks} track(s) in Parquet format")
+        logger.info(f"Written {total_tracks} track(s) as WAV files with JSONL metadata")
 
         logger.info("\n" + "=" * 60)
         logger.info("Generation complete!")
